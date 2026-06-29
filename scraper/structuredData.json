@@ -1,0 +1,81 @@
+{
+  "cases": [
+    {
+      "caseId": "13043",
+      "title": "Mrs",
+      "firstName": "Test",
+      "lastName": "DUMMY FILE",
+      "email": "",
+      "phone": "",
+      "referralDate": "2009-02-14",
+      "dateClosed": "",
+      "employmentStatusId": "",
+      "employmentStatusDescription": "",
+      "causeId": "",
+      "causeDescription": "",
+      "conditionId": "",
+      "conditionDescription": ""
+    },
+    {
+      "caseId": "13098",
+      "title": "Mrs",
+      "firstName": "Test",
+      "lastName": "DUMMY FILE",
+      "email": "",
+      "phone": "",
+      "referralDate": "2009-02-14",
+      "dateClosed": "",
+      "employmentStatusId": "",
+      "employmentStatusDescription": "",
+      "causeId": "",
+      "causeDescription": "",
+      "conditionId": "",
+      "conditionDescription": ""
+    },
+    {
+      "caseId": "13399",
+      "title": "",
+      "firstName": "Test",
+      "lastName": "DUMMY FILE",
+      "email": "sales@casemanager.biz",
+      "phone": "",
+      "referralDate": "",
+      "dateClosed": "2024-02-14",
+      "employmentStatusId": "",
+      "employmentStatusDescription": "",
+      "causeId": "",
+      "causeDescription": "",
+      "conditionId": "",
+      "conditionDescription": ""
+    },
+    {
+      "caseId": "17551",
+      "title": "Mr",
+      "firstName": "For Inductions",
+      "lastName": "DUMMY FILE",
+      "email": "mrdummyfile@gmail.com",
+      "phone": "07 4977 7777",
+      "referralDate": "2016-12-08",
+      "dateClosed": "",
+      "employmentStatusId": "c4c7f7af-80d1-47f0-b544-2a287408d610",
+      "employmentStatusDescription": "Not at Work",
+      "causeId": "",
+      "causeDescription": "",
+      "conditionId": "3fc947f2-d03b-4b68-9da2-f29729959354",
+      "conditionDescription": "Multiple"
+    }
+  ],
+  "causes": [],
+  "conditions": [
+    {
+      "id": "3fc947f2-d03b-4b68-9da2-f29729959354",
+      "description": "Multiple"
+    }
+  ],
+  "employmentStatuses": [
+    {
+      "id": "c4c7f7af-80d1-47f0-b544-2a287408d610",
+      "description": "Not at Work"
+    }
+  ]
+}
