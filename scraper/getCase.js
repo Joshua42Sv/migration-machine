@@ -2,7 +2,7 @@ require('dotenv').config();
 const { chromium } = require('playwright');
 const fs = require('fs');
 const path = require('path');
-const { captureCase } = require('./lib/captureCase');
+const { login, captureCase } = require('./lib/apiClient');
 
 const USERNAME = process.env.CM_USER || '';
 const PASSWORD = process.env.CM_PASS || '';
@@ -20,20 +20,15 @@ function loadCases() {
 }
 
 (async () => {
-  const browser = await chromium.launch({ headless: false });
+  const browser = await chromium.launch({ headless: true });
   const context = await browser.newContext();
-  const page = await context.newPage();
 
   console.error('Logging in...');
-  await page.goto('https://workcom.casemanager.biz/Account/LogOn?ReturnUrl=%2F');
-  await page.getByRole('textbox', { name: 'Username or email' }).fill(USERNAME);
-  await page.getByRole('textbox', { name: 'Password' }).fill(PASSWORD);
-  await page.getByRole('button', { name: 'Sign in', exact: true }).click();
-  await page.waitForURL(url => !url.toString().includes('/LogOn'), { timeout: 15000 });
+  const token = await login(context, USERNAME, PASSWORD);
   console.error('Logged in');
 
   console.error(`Capturing case ${CASE_ID}...`);
-  const endpoints = await captureCase(page, CASE_ID);
+  const endpoints = await captureCase(context, token, CASE_ID);
 
   const cases = loadCases();
   cases[CASE_ID] = { fetchedAt: new Date().toISOString(), endpoints };

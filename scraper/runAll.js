@@ -2,7 +2,7 @@ require('dotenv').config();
 const { chromium } = require('playwright');
 const fs = require('fs');
 const path = require('path');
-const { captureCase } = require('./lib/captureCase');
+const { login, captureCase, getAllLookups } = require('./lib/apiClient');
 
 const USERNAME = process.env.CM_USER || '';
 const PASSWORD = process.env.CM_PASS || '';
@@ -21,21 +21,17 @@ if (!fs.existsSync(LIST_FILE)) {
   process.exit(1);
 }
 
-function saveCases(data) {
+function saveCases(data, lookups) {
   fs.writeFileSync(OUTPUT_FILE, JSON.stringify(data, null, 2));
-  saveStructuredData(data);
+  saveStructuredData(data, lookups);
 }
 
-function buildLookupMap(data) {
+function buildLookupMap(lookups) {
   const map = {};
-  for (const caseData of Object.values(data)) {
-    const lists = caseData.endpoints?.['/Lookup/GetLookupList/'];
-    if (!lists) continue;
-    for (const list of lists) {
-      if (!Array.isArray(list)) continue;
-      for (const item of list) {
-        if (item.ID && item.Description) map[item.ID] = item.Description;
-      }
+  for (const list of Object.values(lookups)) {
+    if (!Array.isArray(list)) continue;
+    for (const item of list) {
+      if (item.ID && item.Description) map[item.ID] = item.Description;
     }
   }
   return map;
@@ -55,8 +51,8 @@ function formatDate(iso) {
   return iso.split('T')[0];
 }
 
-function saveStructuredData(data) {
-  const lookup = buildLookupMap(data);
+function saveStructuredData(data, lookups) {
+  const lookup = buildLookupMap(lookups);
   const cases = [];
   const causesMap = {};
   const conditionsMap = {};
@@ -125,15 +121,14 @@ function readCaseList() {
 
   const browser = await chromium.launch({ headless: true });
   const context = await browser.newContext();
-  const page = await context.newPage();
 
   console.error('Logging in...');
-  await page.goto('https://workcom.casemanager.biz/Account/LogOn?ReturnUrl=%2F');
-  await page.getByRole('textbox', { name: 'Username or email' }).fill(USERNAME);
-  await page.getByRole('textbox', { name: 'Password' }).fill(PASSWORD);
-  await page.getByRole('button', { name: 'Sign in', exact: true }).click();
-  await page.waitForURL(url => !url.toString().includes('/LogOn'), { timeout: 15000 });
+  const token = await login(context, USERNAME, PASSWORD);
   console.error('Logged in\n');
+
+  console.error('Fetching lookup lists...');
+  const lookups = await getAllLookups(context, token);
+  console.error('Done fetching lookups\n');
 
   let done = 0;
   for (const caseId of caseIds) {
@@ -141,14 +136,14 @@ function readCaseList() {
     const progress = `[${done}/${caseIds.length}]`;
     try {
       process.stderr.write(`${progress} Capturing case ${caseId}... `);
-      const endpoints = await captureCase(page, caseId);
+      const endpoints = await captureCase(context, token, caseId);
       cases[caseId] = { fetchedAt: new Date().toISOString(), endpoints };
-      saveCases(cases);
-      console.error(`done (${Object.keys(endpoints).length} endpoints)`);
+      saveCases(cases, lookups);
+      console.error('done');
     } catch (err) {
       console.error(`FAILED: ${err.message}`);
       cases[caseId] = { fetchedAt: new Date().toISOString(), error: err.message };
-      saveCases(cases);
+      saveCases(cases, lookups);
     }
   }
 
