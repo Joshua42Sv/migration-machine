@@ -68,6 +68,7 @@ function saveStructuredData(data, lookups) {
   const causesMap = {};
   const conditionsMap = {};
   const employmentStatusesMap = {};
+  const statusesMap = {};
 
   for (const [caseId, caseData] of Object.entries(data)) {
     if (caseData.error) continue;
@@ -89,10 +90,13 @@ function saveStructuredData(data, lookups) {
     const conditionDescription = resolveId(lookup, caseInfo.ConditionID);
     const employmentStatusId = nullId(caseInfo.EmploymentStatusID) ? '' : caseInfo.EmploymentStatusID;
     const employmentStatusDescription = resolveId(lookup, caseInfo.EmploymentStatusID);
+    const statusId = nullId(caseInfo.StatusID) ? '' : caseInfo.StatusID;
+    const statusDescription = resolveId(lookup, caseInfo.StatusID);
 
     if (causeId) causesMap[causeId] = causeDescription;
     if (conditionId) conditionsMap[conditionId] = conditionDescription;
     if (employmentStatusId) employmentStatusesMap[employmentStatusId] = employmentStatusDescription;
+    if (statusId) statusesMap[statusId] = statusDescription;
 
     const clientAddress = buildAddress(lookup, {
       street: contactInfo.Street,
@@ -131,6 +135,8 @@ function saveStructuredData(data, lookups) {
       claimNumber: caseInfo.ClaimNo ?? '',
       referralDate: formatDate(caseInfo.DateOfReferral),
       dateClosed: formatDate(caseInfo.DateClosed),
+      statusId,
+      statusDescription,
       clientAddress,
       clientBillingAddress,
       referrer,
@@ -146,8 +152,9 @@ function saveStructuredData(data, lookups) {
   const causes = Object.entries(causesMap).map(([id, description]) => ({ id, description }));
   const conditions = Object.entries(conditionsMap).map(([id, description]) => ({ id, description }));
   const employmentStatuses = Object.entries(employmentStatusesMap).map(([id, description]) => ({ id, description }));
+  const statuses = Object.entries(statusesMap).map(([id, description]) => ({ id, description }));
 
-  fs.writeFileSync(STRUCTURED_FILE, JSON.stringify({ cases, causes, conditions, employmentStatuses }, null, 2));
+  fs.writeFileSync(STRUCTURED_FILE, JSON.stringify({ cases, causes, conditions, employmentStatuses, statuses }, null, 2));
 }
 
 function readCaseList() {
