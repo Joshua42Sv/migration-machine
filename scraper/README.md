@@ -49,14 +49,41 @@ Status, Cause, Condition, etc.) once, then loops over every case ID in
 `caseList.txt` (or a path you pass in) fetching case data + contacts.
 
 Writes:
-- `cases.json` — raw API responses per case
-- `structuredData.json` — flattened client/case fields ready for migration
-  (name, contact details, cause/condition descriptions, etc.), plus the
-  distinct causes/conditions/employment statuses referenced
+- `cases.json` — raw API responses per case (including the full client
+  contact record fetched from `/CaseContact/GetData`)
+- `structuredData.json` — client/case fields shaped to match the importer
+  API's `CaseImportDto` (`clientFirstName`, `clientAddress`, `claimNumber`,
+  `referralDate`, etc.), plus cause/condition/employment status
+  descriptions and the distinct values referenced
+
+The client's address (`clientAddress`) is always included; a separate
+billing address (`clientBillingAddress`) is only included when the case
+contact has `Address2UsePrimary` set to false in Case Manager.
+
+The referrer (`referrer`) is the case contact whose roles include
+"Referrer" — a contact can hold this alongside other roles (e.g. "Bill To,
+Referrer"), so it's matched on role membership rather than primary role.
 
 **Note:** this overwrites `cases.json`/`structuredData.json` on every run — it
 does not merge with a previous run's output. Run it against the full
 `caseList.txt`, not incrementally.
+
+### `node uploadCases.js [structuredDataFile]`
+
+Reads `structuredData.json` and POSTs each case, one at a time, to the
+production importer API (`http://localhost:8080/api/importer/case` by
+default, override with `IMPORT_URL`). Failures for individual cases are
+logged and don't stop the run; a summary of failed case IDs is printed at
+the end.
+
+Immediately after a case uploads successfully, its documents are uploaded
+too: reads `documents/{caseId}/manifest.json` and POSTs each file as
+`multipart/form-data` to `http://localhost:8080/api/importer/case/file`
+(override with `IMPORT_FILE_URL`), one at a time. `uploadedById` is
+currently a hardcoded placeholder in `uploadCases.js` — replace it with a
+real mapped user ID before a production run. File failures are logged and
+tallied separately from case failures; run `downloadDocuments.js` first so
+manifests exist.
 
 ### `node downloadDocuments.js [caseListFile]`
 
@@ -68,15 +95,19 @@ Downloads every document attached to each case in `caseList.txt` into
   Subject/Date headers + HTML body) so they open in any mail client.
 - In-app formatted-text notes (`.cmrtf`) are saved as `.html`, preserving
   formatting.
+- Each case directory also gets a `manifest.json` listing every file's
+  original Case Manager title and a `fileType` (`EMAIL`, `CASE_NOTE`,
+  `PDF`, `WORD`, `EXCEL`, `IMAGE`) used by `uploadCases.js`.
 
-Existing files in `documents/` are left alone; re-running won't overwrite them
-(duplicate filenames get a `(2)`, `(3)`, ... suffix instead).
+**Note:** this deletes and fully recreates the whole `documents/` directory
+on every run — it does not do an incremental/resumable download.
 
 ## Suggested order for a full migration run
 
 1. `node findCaseListEndpoint.js` — build the full `caseList.txt`
 2. `node runAll.js` — export case + contact data
 3. `node downloadDocuments.js` — download all documents
+4. `node uploadCases.js` — import case data into the new production system
 
 ## Known limitations / things to check before a large (~2,000 case) run
 

@@ -62,6 +62,21 @@ function buildHtml(doc) {
   return `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>${doc.Title ?? ''}</title></head><body>${body}</body></html>`;
 }
 
+const IMAGE_EXTENSIONS = new Set(['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.tif', '.webp']);
+const WORD_EXTENSIONS = new Set(['.doc', '.docx']);
+const EXCEL_EXTENSIONS = new Set(['.xls', '.xlsx']);
+
+function classifyFileType(doc) {
+  if (!doc.IsFile) return doc.FileExtension === '.eml' ? 'EMAIL' : 'CASE_NOTE';
+
+  const ext = (doc.FileExtension || '').toLowerCase();
+  if (ext === '.pdf') return 'PDF';
+  if (WORD_EXTENSIONS.has(ext)) return 'WORD';
+  if (EXCEL_EXTENSIONS.has(ext)) return 'EXCEL';
+  if (IMAGE_EXTENSIONS.has(ext)) return 'IMAGE';
+  return 'CASE_NOTE';
+}
+
 async function downloadNonFileDoc(context, token, caseId, doc) {
   const data = await getCaseDocumentData(context, token, caseId, doc.ID);
   if (data.Attachments?.length > 0) {
@@ -75,6 +90,7 @@ async function downloadNonFileDoc(context, token, caseId, doc) {
 
 (async () => {
   const caseIds = readCaseList();
+  fs.rmSync(OUTPUT_DIR, { recursive: true, force: true });
   fs.mkdirSync(OUTPUT_DIR, { recursive: true });
 
   console.error(`Total: ${caseIds.length} cases to fetch documents for`);
@@ -101,13 +117,21 @@ async function downloadNonFileDoc(context, token, caseId, doc) {
       const caseDir = path.join(OUTPUT_DIR, caseId);
       fs.mkdirSync(caseDir, { recursive: true });
 
+      const manifest = [];
       for (const doc of documents) {
         const { buffer, filename } = doc.IsFile
           ? await downloadDocumentFile(context, doc.ID)
           : await downloadNonFileDoc(context, token, caseId, doc);
         const safeName = uniquePath(caseDir, sanitizeFilename(filename));
         fs.writeFileSync(path.join(caseDir, safeName), buffer);
+        manifest.push({
+          filename: safeName,
+          title: doc.Title ?? safeName,
+          fileType: classifyFileType(doc),
+          dateUploaded: doc.DateCreated ?? '',
+        });
       }
+      fs.writeFileSync(path.join(caseDir, 'manifest.json'), JSON.stringify(manifest, null, 2));
       console.error(`${progress} Case ${caseId}: saved ${documents.length} document(s)`);
     } catch (err) {
       console.error(`${progress} Case ${caseId} FAILED: ${err.message}`);

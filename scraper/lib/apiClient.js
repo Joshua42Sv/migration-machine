@@ -3,6 +3,7 @@ const BASE_URL = 'https://workcom.casemanager.biz';
 const LOOKUP_TYPES = [
   'Category', 'Status', 'EmpStatus', 'Condition', 'CaseFlag', 'Cause',
   'Requirement', 'ReferralType', 'Outcome', 'Team', 'Office', 'InvoiceGroup',
+  'Region', 'Country', 'Position',
 ];
 
 async function login(context, username, password) {
@@ -42,6 +43,14 @@ async function getCaseContacts(context, token, caseId) {
   return res.json();
 }
 
+async function getCaseContactData(context, token, caseId, contactId) {
+  const res = await context.request.post(`${BASE_URL}/CaseContact/GetData`, {
+    headers: buildHeaders(token, 'application/json; charset=UTF-8'),
+    data: { component: 'case', caseNumber: caseId, tabID: 'contacts', ID: contactId },
+  });
+  return res.json();
+}
+
 async function getLookupList(context, token, lookupType) {
   const res = await context.request.post(`${BASE_URL}/Lookup/GetLookupList/`, {
     headers: buildHeaders(token, 'application/x-www-form-urlencoded; charset=UTF-8'),
@@ -63,10 +72,28 @@ async function captureCase(context, token, caseId) {
     getCaseData(context, token, caseId),
     getCaseContacts(context, token, caseId),
   ]);
-  return {
+
+  const endpoints = {
     '/Case/GetData': [caseData],
     '/CaseContact/_List': [contacts],
   };
+
+  const contactRows = Array.isArray(contacts?.data) ? contacts.data : [];
+  const hasRole = (row, role) => (row.RoleNames ?? '').split(',').map(r => r.trim()).includes(role);
+
+  const client = contactRows.find(c => c.PrimaryRoleName === 'Client');
+  if (client) {
+    const contactDetail = await getCaseContactData(context, token, caseId, client.ID);
+    endpoints['/CaseContact/GetData'] = [contactDetail];
+  }
+
+  const referrer = contactRows.find(c => hasRole(c, 'Referrer'));
+  if (referrer) {
+    const contactDetail = await getCaseContactData(context, token, caseId, referrer.ID);
+    endpoints['referrerContact'] = [contactDetail];
+  }
+
+  return endpoints;
 }
 
 async function getCaseDocuments(context, token, caseId) {
@@ -96,6 +123,6 @@ async function downloadDocumentFile(context, documentId) {
 }
 
 module.exports = {
-  login, getCaseData, getCaseContacts, getLookupList, getAllLookups, captureCase,
+  login, getCaseData, getCaseContacts, getCaseContactData, getLookupList, getAllLookups, captureCase,
   getCaseDocuments, downloadDocumentFile, getCaseDocumentData, LOOKUP_TYPES,
 };

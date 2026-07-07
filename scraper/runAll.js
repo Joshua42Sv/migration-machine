@@ -51,6 +51,17 @@ function formatDate(iso) {
   return iso.split('T')[0];
 }
 
+function buildAddress(map, { street, suburb, postalCode, regionId, countryId }) {
+  return {
+    addressLine1: street ?? '',
+    addressLine2: '',
+    suburb: suburb ?? '',
+    state: resolveId(map, regionId),
+    postcode: postalCode ?? '',
+    country: resolveId(map, countryId),
+  };
+}
+
 function saveStructuredData(data, lookups) {
   const lookup = buildLookupMap(lookups);
   const cases = [];
@@ -69,6 +80,8 @@ function saveStructuredData(data, lookups) {
 
     const caseInfo = caseData.endpoints?.['/Case/GetData']?.[0] ?? {};
     const titlePart = client.ContactName?.split(', ')[2] ?? '';
+    const contactInfo = caseData.endpoints?.['/CaseContact/GetData']?.[0]?.ContactInfo ?? {};
+    const referrerInfo = caseData.endpoints?.referrerContact?.[0]?.ContactInfo ?? {};
 
     const causeId = nullId(caseInfo.CauseID) ? '' : caseInfo.CauseID;
     const causeDescription = resolveId(lookup, caseInfo.CauseID);
@@ -81,15 +94,46 @@ function saveStructuredData(data, lookups) {
     if (conditionId) conditionsMap[conditionId] = conditionDescription;
     if (employmentStatusId) employmentStatusesMap[employmentStatusId] = employmentStatusDescription;
 
+    const clientAddress = buildAddress(lookup, {
+      street: contactInfo.Street,
+      suburb: contactInfo.Suburb,
+      postalCode: contactInfo.PostalCode,
+      regionId: contactInfo.RegionID,
+      countryId: contactInfo.CountryID,
+    });
+
+    const clientBillingAddress = contactInfo.Address2UsePrimary === false
+      ? buildAddress(lookup, {
+        street: contactInfo.Street2,
+        suburb: contactInfo.Suburb2,
+        postalCode: contactInfo.PostalCode2,
+        regionId: contactInfo.RegionID2,
+        countryId: contactInfo.CountryID2,
+      })
+      : null;
+
+    const referrer = {
+      firstName: referrerInfo.FirstName ?? '',
+      lastName: referrerInfo.LastName ?? '',
+      email: referrerInfo.Email1 ?? '',
+      phone: referrerInfo.Phone1 ?? '',
+      fax: referrerInfo.Fax ?? '',
+      position: resolveId(lookup, referrerInfo.PositionID),
+    };
+
     cases.push({
       caseId,
-      title: titlePart,
-      firstName: client.FirstName ?? '',
-      lastName: client.LastName ?? '',
-      email: client.Email ?? '',
-      phone: client.Phone ?? '',
+      clientTitle: titlePart,
+      clientFirstName: client.FirstName ?? '',
+      clientLastName: client.LastName ?? '',
+      clientEmail: client.Email ?? '',
+      clientPhone: client.Phone ?? '',
+      claimNumber: caseInfo.ClaimNo ?? '',
       referralDate: formatDate(caseInfo.DateOfReferral),
       dateClosed: formatDate(caseInfo.DateClosed),
+      clientAddress,
+      clientBillingAddress,
+      referrer,
       employmentStatusId,
       employmentStatusDescription,
       causeId,
