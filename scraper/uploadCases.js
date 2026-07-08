@@ -9,6 +9,8 @@ const IMPORT_URL =
   process.env.IMPORT_URL || "http://localhost:8080/api/importer/case";
 const IMPORT_FILE_URL =
   process.env.IMPORT_FILE_URL || "http://localhost:8080/api/importer/case/file";
+const IMPORT_STAFF_URL =
+  process.env.IMPORT_STAFF_URL || "http://localhost:8080/api/importer/staff";
 const UPLOADED_BY_ID = "5a04e3e0-78bd-4fd8-bd93-a64fe9acb784"; // TODO: Replace with actual user ID, mapped from old to new
 
 if (!fs.existsSync(STRUCTURED_FILE)) {
@@ -17,7 +19,28 @@ if (!fs.existsSync(STRUCTURED_FILE)) {
   process.exit(1);
 }
 
-function toCaseImportDto(caseRecord) {
+const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+function randomEmail() {
+  const digits = Math.floor(100000000 + Math.random() * 900000000);
+  return `${digits}@example.com`;
+}
+
+function toStaffImportDto(employee) {
+  const email = EMAIL_PATTERN.test(employee.email) ? employee.email : randomEmail();
+
+  const dto = {
+    firstName: employee.firstName || "Unknown",
+    lastName: employee.lastName || "Unknown",
+    email,
+  };
+
+  if (employee.phone) dto.phone = employee.phone;
+
+  return dto;
+}
+
+function toCaseImportDto(caseRecord, resolvedEmailByEmployeeId) {
   const address = caseRecord.clientAddress || {};
   const referrer = caseRecord.referrer || {};
 
@@ -55,7 +78,27 @@ function toCaseImportDto(caseRecord) {
     dto.clientBillingAddress = caseRecord.clientBillingAddress;
   }
 
+  const assignedUserEmail = resolvedEmailByEmployeeId.get(caseRecord.assignedUserId);
+  if (assignedUserEmail) {
+    dto.assignedUserEmail = assignedUserEmail;
+  }
+
   return dto;
+}
+
+async function uploadStaff(dto) {
+  const res = await fetch(IMPORT_STAFF_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(dto),
+  });
+
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new Error(
+      `${res.status} ${res.statusText}${body ? ` - ${body}` : ""}`,
+    );
+  }
 }
 
 async function uploadCase(dto) {
@@ -102,7 +145,34 @@ async function uploadCaseFile(caseId, entry) {
 }
 
 (async () => {
-  const { cases } = JSON.parse(fs.readFileSync(STRUCTURED_FILE, "utf8"));
+  const { cases, employees } = JSON.parse(fs.readFileSync(STRUCTURED_FILE, "utf8"));
+
+  console.error(`Total: ${employees.length} staff to upload`);
+  console.error(`Target: ${IMPORT_STAFF_URL}\n`);
+
+  const failedStaff = [];
+  const resolvedEmailByEmployeeId = new Map();
+  let staffDone = 0;
+
+  for (const employee of employees) {
+    staffDone++;
+    const progress = `[${staffDone}/${employees.length}]`;
+    const dto = toStaffImportDto(employee);
+    resolvedEmailByEmployeeId.set(employee.id, dto.email);
+
+    try {
+      process.stderr.write(`${progress} Uploading staff ${dto.email}... `);
+      await uploadStaff(dto);
+      console.error("done");
+    } catch (err) {
+      console.error(`FAILED: ${err.message}`);
+      failedStaff.push({ email: dto.email, error: err.message });
+    }
+  }
+
+  console.error(
+    `\nFinished. ${staffDone - failedStaff.length}/${staffDone} staff uploaded successfully.\n`,
+  );
 
   console.error(`Total: ${cases.length} cases to upload`);
   console.error(`Target: ${IMPORT_URL}\n`);
@@ -115,7 +185,7 @@ async function uploadCaseFile(caseId, entry) {
   for (const caseRecord of cases) {
     done++;
     const progress = `[${done}/${cases.length}]`;
-    const dto = toCaseImportDto(caseRecord);
+    const dto = toCaseImportDto(caseRecord, resolvedEmailByEmployeeId);
 
     try {
       process.stderr.write(`${progress} Uploading case ${dto.caseId}... `);
@@ -160,6 +230,11 @@ async function uploadCaseFile(caseId, entry) {
     console.error(`${failedFiles.length} file(s) failed:`);
     for (const f of failedFiles)
       console.error(`  - ${f.caseId}/${f.filename}: ${f.error}`);
+    process.exitCode = 1;
+  }
+  if (failedStaff.length) {
+    console.error(`${failedStaff.length} staff member(s) failed:`);
+    for (const f of failedStaff) console.error(`  - ${f.email}: ${f.error}`);
     process.exitCode = 1;
   }
 })();

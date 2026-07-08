@@ -118,6 +118,7 @@ function saveStructuredData(data, lookups, employeeList) {
     const assignedUserId = nullId(caseInfo.AssignedToID) ? '' : caseInfo.AssignedToID;
     const assignedUser = employeeMap[assignedUserId];
     const assignedUserName = assignedUser ? `${assignedUser.firstName} ${assignedUser.lastName}`.trim() : '';
+    const assignedUserEmail = assignedUser?.email ?? '';
     if (assignedUserId) usedEmployeeIds.add(assignedUserId);
 
     const clientAddress = buildAddress(lookup, {
@@ -161,6 +162,7 @@ function saveStructuredData(data, lookups, employeeList) {
       statusDescription,
       assignedUserId,
       assignedUserName,
+      assignedUserEmail,
       clientAddress,
       clientBillingAddress,
       referrer,
