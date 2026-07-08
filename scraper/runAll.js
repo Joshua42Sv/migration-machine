@@ -2,7 +2,7 @@ require('dotenv').config();
 const { chromium } = require('playwright');
 const fs = require('fs');
 const path = require('path');
-const { login, captureCase, getAllLookups } = require('./lib/apiClient');
+const { login, captureCase, getAllLookups, getEmployeeList } = require('./lib/apiClient');
 
 const USERNAME = process.env.CM_USER || '';
 const PASSWORD = process.env.CM_PASS || '';
@@ -21,9 +21,9 @@ if (!fs.existsSync(LIST_FILE)) {
   process.exit(1);
 }
 
-function saveCases(data, lookups) {
+function saveCases(data, lookups, employeeList) {
   fs.writeFileSync(OUTPUT_FILE, JSON.stringify(data, null, 2));
-  saveStructuredData(data, lookups);
+  saveStructuredData(data, lookups, employeeList);
 }
 
 function buildLookupMap(lookups) {
@@ -33,6 +33,21 @@ function buildLookupMap(lookups) {
     for (const item of list) {
       if (item.ID && item.Description) map[item.ID] = item.Description;
     }
+  }
+  return map;
+}
+
+function buildEmployeeMap(employeeList) {
+  const map = {};
+  for (const employee of employeeList) {
+    if (!employee.ID) continue;
+    map[employee.ID] = {
+      firstName: employee.FirstName ?? '',
+      lastName: employee.LastName ?? '',
+      email: employee.UserID ?? '',
+      phone: employee.Phone1 ?? '',
+      qualifications: employee.ServicesDescription ?? '',
+    };
   }
   return map;
 }
@@ -62,13 +77,15 @@ function buildAddress(map, { street, suburb, postalCode, regionId, countryId }) 
   };
 }
 
-function saveStructuredData(data, lookups) {
+function saveStructuredData(data, lookups, employeeList) {
   const lookup = buildLookupMap(lookups);
+  const employeeMap = buildEmployeeMap(employeeList);
   const cases = [];
   const causesMap = {};
   const conditionsMap = {};
   const employmentStatusesMap = {};
   const statusesMap = {};
+  const usedEmployeeIds = new Set();
 
   for (const [caseId, caseData] of Object.entries(data)) {
     if (caseData.error) continue;
@@ -97,6 +114,11 @@ function saveStructuredData(data, lookups) {
     if (conditionId) conditionsMap[conditionId] = conditionDescription;
     if (employmentStatusId) employmentStatusesMap[employmentStatusId] = employmentStatusDescription;
     if (statusId) statusesMap[statusId] = statusDescription;
+
+    const assignedUserId = nullId(caseInfo.AssignedToID) ? '' : caseInfo.AssignedToID;
+    const assignedUser = employeeMap[assignedUserId];
+    const assignedUserName = assignedUser ? `${assignedUser.firstName} ${assignedUser.lastName}`.trim() : '';
+    if (assignedUserId) usedEmployeeIds.add(assignedUserId);
 
     const clientAddress = buildAddress(lookup, {
       street: contactInfo.Street,
@@ -137,6 +159,8 @@ function saveStructuredData(data, lookups) {
       dateClosed: formatDate(caseInfo.DateClosed),
       statusId,
       statusDescription,
+      assignedUserId,
+      assignedUserName,
       clientAddress,
       clientBillingAddress,
       referrer,
@@ -153,8 +177,11 @@ function saveStructuredData(data, lookups) {
   const conditions = Object.entries(conditionsMap).map(([id, description]) => ({ id, description }));
   const employmentStatuses = Object.entries(employmentStatusesMap).map(([id, description]) => ({ id, description }));
   const statuses = Object.entries(statusesMap).map(([id, description]) => ({ id, description }));
+  const employees = Object.entries(employeeMap)
+    .filter(([id]) => usedEmployeeIds.has(id))
+    .map(([id, employee]) => ({ id, ...employee }));
 
-  fs.writeFileSync(STRUCTURED_FILE, JSON.stringify({ cases, causes, conditions, employmentStatuses, statuses }, null, 2));
+  fs.writeFileSync(STRUCTURED_FILE, JSON.stringify({ cases, causes, conditions, employmentStatuses, statuses, employees }, null, 2));
 }
 
 function readCaseList() {
@@ -181,6 +208,10 @@ function readCaseList() {
   const lookups = await getAllLookups(context, token);
   console.error('Done fetching lookups\n');
 
+  console.error('Fetching employee list...');
+  const employeeList = await getEmployeeList(context, token);
+  console.error('Done fetching employees\n');
+
   let done = 0;
   for (const caseId of caseIds) {
     done++;
@@ -189,12 +220,12 @@ function readCaseList() {
       process.stderr.write(`${progress} Capturing case ${caseId}... `);
       const endpoints = await captureCase(context, token, caseId);
       cases[caseId] = { fetchedAt: new Date().toISOString(), endpoints };
-      saveCases(cases, lookups);
+      saveCases(cases, lookups, employeeList);
       console.error('done');
     } catch (err) {
       console.error(`FAILED: ${err.message}`);
       cases[caseId] = { fetchedAt: new Date().toISOString(), error: err.message };
-      saveCases(cases, lookups);
+      saveCases(cases, lookups, employeeList);
     }
   }
 

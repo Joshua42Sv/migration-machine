@@ -59,6 +59,15 @@ async function getLookupList(context, token, lookupType) {
   return res.json();
 }
 
+async function getEmployeeList(context, token) {
+  const res = await context.request.post(`${BASE_URL}/EmployeeList/_List`, {
+    headers: buildHeaders(token, 'application/x-www-form-urlencoded; charset=UTF-8'),
+    form: { ShowInactive: false },
+  });
+  const body = await res.json();
+  return body.data ?? [];
+}
+
 async function getAllLookups(context, token) {
   const lookups = {};
   for (const type of LOOKUP_TYPES) {
@@ -123,6 +132,7 @@ async function downloadDocumentFile(context, documentId) {
 }
 
 module.exports = {
-  login, getCaseData, getCaseContacts, getCaseContactData, getLookupList, getAllLookups, captureCase,
+  login, getCaseData, getCaseContacts, getCaseContactData, getLookupList, getAllLookups,
+  getEmployeeList, captureCase,
   getCaseDocuments, downloadDocumentFile, getCaseDocumentData, LOOKUP_TYPES,
 };
