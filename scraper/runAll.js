@@ -85,6 +85,8 @@ function saveStructuredData(data, lookups, employeeList) {
   const conditionsMap = {};
   const employmentStatusesMap = {};
   const statusesMap = {};
+  const categoriesMap = {};
+  const requirementsMap = {};
   const usedEmployeeIds = new Set();
 
   for (const [caseId, caseData] of Object.entries(data)) {
@@ -109,11 +111,17 @@ function saveStructuredData(data, lookups, employeeList) {
     const employmentStatusDescription = resolveId(lookup, caseInfo.EmploymentStatusID);
     const statusId = nullId(caseInfo.StatusID) ? '' : caseInfo.StatusID;
     const statusDescription = resolveId(lookup, caseInfo.StatusID);
+    const categoryId = nullId(caseInfo.CategoryID) ? '' : caseInfo.CategoryID;
+    const categoryDescription = resolveId(lookup, caseInfo.CategoryID);
+    const requirementId = nullId(caseInfo.RequirementID) ? '' : caseInfo.RequirementID;
+    const requirementDescription = resolveId(lookup, caseInfo.RequirementID);
 
     if (causeId) causesMap[causeId] = causeDescription;
     if (conditionId) conditionsMap[conditionId] = conditionDescription;
     if (employmentStatusId) employmentStatusesMap[employmentStatusId] = employmentStatusDescription;
     if (statusId) statusesMap[statusId] = statusDescription;
+    if (categoryId) categoriesMap[categoryId] = categoryDescription;
+    if (requirementId) requirementsMap[requirementId] = requirementDescription;
 
     const assignedUserId = nullId(caseInfo.AssignedToID) ? '' : caseInfo.AssignedToID;
     const assignedUser = employeeMap[assignedUserId];
@@ -160,6 +168,10 @@ function saveStructuredData(data, lookups, employeeList) {
       dateClosed: formatDate(caseInfo.DateClosed),
       statusId,
       statusDescription,
+      categoryId,
+      categoryDescription,
+      requirementId,
+      requirementDescription,
       assignedUserId,
       assignedUserName,
       assignedUserEmail,
@@ -179,11 +191,13 @@ function saveStructuredData(data, lookups, employeeList) {
   const conditions = Object.entries(conditionsMap).map(([id, description]) => ({ id, description }));
   const employmentStatuses = Object.entries(employmentStatusesMap).map(([id, description]) => ({ id, description }));
   const statuses = Object.entries(statusesMap).map(([id, description]) => ({ id, description }));
+  const categories = Object.entries(categoriesMap).map(([id, description]) => ({ id, description }));
+  const requirements = Object.entries(requirementsMap).map(([id, description]) => ({ id, description }));
   const employees = Object.entries(employeeMap)
     .filter(([id]) => usedEmployeeIds.has(id))
     .map(([id, employee]) => ({ id, ...employee }));
 
-  fs.writeFileSync(STRUCTURED_FILE, JSON.stringify({ cases, causes, conditions, employmentStatuses, statuses, employees }, null, 2));
+  fs.writeFileSync(STRUCTURED_FILE, JSON.stringify({ cases, causes, conditions, employmentStatuses, statuses, categories, requirements, employees }, null, 2));
 }
 
 function readCaseList() {
