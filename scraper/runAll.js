@@ -77,6 +77,66 @@ function buildAddress(map, { street, suburb, postalCode, regionId, countryId }) 
   };
 }
 
+// Each estimate in the source system becomes one billing template, its cost
+// rows the template's items. A /CaseEstimate/GetData response is a flat tree:
+// the row carrying an Estimate payload is the estimate itself (ItemType is
+// not reliable - grouping rows reuse 0), rows with a Cost payload are the
+// billable line items, possibly nested under grouping rows. Money is ex-tax
+// dollars -> cents, hourly quantities (CostType 0) are hours -> minutes.
+function buildBillingTemplates(caseId, endpoints) {
+  const estimateList = endpoints?.['/CaseEstimate/_List']?.[0] ?? [];
+  const itemsByEstimateId = {};
+
+  for (const response of endpoints?.['/CaseEstimate/GetData'] ?? []) {
+    const rows = Array.isArray(response?.Items) ? response.Items : [];
+    const rowById = new Map(rows.map(row => [row.ID, row]));
+    const ownerEstimateId = (row) => {
+      let node = row;
+      while (node && !node.Estimate) node = rowById.get(node.ParentID);
+      return node?.ID ?? '';
+    };
+
+    for (const row of rows) {
+      if (!row.Cost) continue;
+      const estimateId = ownerEstimateId(row);
+      (itemsByEstimateId[estimateId] ??= []).push(row.Cost);
+    }
+  }
+
+  return estimateList.map(estimate => {
+    const createdAt = formatDate(estimate.DateCreated);
+    const expiryDate = formatDate(estimate.FinishDate);
+
+    const items = (itemsByEstimateId[estimate.ID] ?? []).map(cost => {
+      const hourly = cost.CostType === 0;
+      const item = {
+        name: cost.Description || 'Unknown',
+        chargeCode: cost.ChargeCode ?? '',
+        billingType: hourly ? 'HOURLY' : 'FIXED_AMOUNT',
+        taxType: cost.UnitChargeTaxCode === 'GST' || cost.UnitChargeTaxRate > 0 ? 'GST' : 'GST_FREE',
+        rate: Math.round((cost.UnitChargeAmtExTax ?? 0) * 100),
+        quantity: hourly ? Math.round((cost.Quantity ?? 0) * 60) : Math.round(cost.Quantity ?? 0),
+        billingTemplateInstanceId: estimate.ID,
+        createdAt: formatDate(cost.StartDate) || createdAt,
+      };
+      const itemExpiry = formatDate(cost.FinishDate) || expiryDate;
+      if (itemExpiry) item.expiryDate = itemExpiry;
+      return item;
+    });
+
+    const template = {
+      id: estimate.ID,
+      name: estimate.Description ?? '',
+      items,
+      caseId,
+      createdAt,
+      archived: estimate.IsCurrent !== true,
+    };
+    if (expiryDate) template.expiryDate = expiryDate;
+    return template;
+  });
+}
+
 function saveStructuredData(data, lookups, employeeList) {
   const lookup = buildLookupMap(lookups);
   const employeeMap = buildEmployeeMap(employeeList);
@@ -156,6 +216,8 @@ function saveStructuredData(data, lookups, employeeList) {
       position: resolveId(lookup, referrerInfo.PositionID),
     };
 
+    const billingTemplates = buildBillingTemplates(caseId, caseData.endpoints);
+
     cases.push({
       caseId,
       clientTitle: titlePart,
@@ -184,6 +246,7 @@ function saveStructuredData(data, lookups, employeeList) {
       causeDescription,
       conditionId,
       conditionDescription,
+      billingTemplates,
     });
   }
 

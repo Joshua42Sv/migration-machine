@@ -27,7 +27,9 @@ function randomEmail() {
 }
 
 function toStaffImportDto(employee) {
-  const email = EMAIL_PATTERN.test(employee.email) ? employee.email : randomEmail();
+  const email = EMAIL_PATTERN.test(employee.email)
+    ? employee.email
+    : randomEmail();
 
   const dto = {
     firstName: employee.firstName || "Unknown",
@@ -70,15 +72,21 @@ function toCaseImportDto(caseRecord, resolvedEmailByEmployeeId) {
       fax: referrer.fax || "",
       position: referrer.position || "",
     },
-    customerId: "937e639b-0c81-487f-8c5a-39b4d957eb3d", // TODO: Replace with actual customer ID, mapped from old to new
-    requirementId: "8dc1ee56-6069-4a6e-97e9-1e79bf69c7cc", // TODO: Replace with actual requirement ID, mapped from old to new
+    customerId: "cefc5f16-9c6e-4580-996b-9e881a2e7bb2", // TODO: Replace with actual customer ID, mapped from old to new
+    requirementId: "ad641c36-2992-4d31-8cdc-5b8890a81427", // TODO: Replace with actual requirement ID, mapped from old to new
   };
 
   if (caseRecord.clientBillingAddress) {
     dto.clientBillingAddress = caseRecord.clientBillingAddress;
   }
 
-  const assignedUserEmail = resolvedEmailByEmployeeId.get(caseRecord.assignedUserId);
+  if (caseRecord.billingTemplates?.length) {
+    dto.billingTemplates = caseRecord.billingTemplates;
+  }
+
+  const assignedUserEmail = resolvedEmailByEmployeeId.get(
+    caseRecord.assignedUserId,
+  );
   if (assignedUserEmail) {
     dto.assignedUserEmail = assignedUserEmail;
   }
@@ -145,7 +153,9 @@ async function uploadCaseFile(caseId, entry) {
 }
 
 (async () => {
-  const { cases, employees } = JSON.parse(fs.readFileSync(STRUCTURED_FILE, "utf8"));
+  const { cases, employees } = JSON.parse(
+    fs.readFileSync(STRUCTURED_FILE, "utf8"),
+  );
 
   console.error(`Total: ${employees.length} staff to upload`);
   console.error(`Target: ${IMPORT_STAFF_URL}\n`);

@@ -68,6 +68,27 @@ async function getEmployeeList(context, token) {
   return body.data ?? [];
 }
 
+async function getCaseEstimates(context, token, caseId) {
+  const res = await context.request.post(`${BASE_URL}/CaseEstimate/_List`, {
+    headers: buildHeaders(token, 'application/x-www-form-urlencoded; charset=UTF-8'),
+    form: { caseNumber: caseId },
+  });
+  const text = await res.text();
+  // Responds 500 with a plain-text message when a case has no estimates
+  if (text.includes('There are no estimates')) return [];
+  if (!res.ok()) throw new Error(`/CaseEstimate/_List ${res.status()}: ${text.slice(0, 100)}`);
+  const body = JSON.parse(text);
+  return body.data ?? [];
+}
+
+async function getCaseEstimateData(context, token, caseId, estimateId) {
+  const res = await context.request.post(`${BASE_URL}/CaseEstimate/GetData`, {
+    headers: buildHeaders(token, 'application/json; charset=UTF-8'),
+    data: { component: 'case', caseNumber: caseId, tabID: 'estimates', ID: estimateId },
+  });
+  return res.json();
+}
+
 async function getAllLookups(context, token) {
   const lookups = {};
   for (const type of LOOKUP_TYPES) {
@@ -102,6 +123,15 @@ async function captureCase(context, token, caseId) {
     endpoints['referrerContact'] = [contactDetail];
   }
 
+  const estimateList = await getCaseEstimates(context, token, caseId);
+  endpoints['/CaseEstimate/_List'] = [estimateList];
+  const estimateDetails = [];
+  for (const estimate of estimateList) {
+    if (!estimate.ID) continue;
+    estimateDetails.push(await getCaseEstimateData(context, token, caseId, estimate.ID));
+  }
+  endpoints['/CaseEstimate/GetData'] = estimateDetails;
+
   return endpoints;
 }
 
@@ -134,5 +164,6 @@ async function downloadDocumentFile(context, documentId) {
 module.exports = {
   login, getCaseData, getCaseContacts, getCaseContactData, getLookupList, getAllLookups,
   getEmployeeList, captureCase,
+  getCaseEstimates, getCaseEstimateData,
   getCaseDocuments, downloadDocumentFile, getCaseDocumentData, LOOKUP_TYPES,
 };
