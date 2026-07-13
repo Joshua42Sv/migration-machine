@@ -81,8 +81,9 @@ function buildAddress(map, { street, suburb, postalCode, regionId, countryId }) 
 // rows the template's items. A /CaseEstimate/GetData response is a flat tree:
 // the row carrying an Estimate payload is the estimate itself (ItemType is
 // not reliable - grouping rows reuse 0), rows with a Cost payload are the
-// billable line items, possibly nested under grouping rows. Money is ex-tax
-// dollars -> cents, hourly quantities (CostType 0) are hours -> minutes.
+// billable line items, possibly nested under grouping rows. NotusPoint money
+// is GST-INCLUSIVE cents (invoicing extracts GST from totals), so rates come
+// from UnitChargeAmt as-is; hourly quantities (CostType 0) are hours -> minutes.
 function buildBillingTemplates(caseId, endpoints) {
   const estimateList = endpoints?.['/CaseEstimate/_List']?.[0] ?? [];
   const itemsByEstimateId = {};
@@ -110,11 +111,12 @@ function buildBillingTemplates(caseId, endpoints) {
     const items = (itemsByEstimateId[estimate.ID] ?? []).map(cost => {
       const hourly = cost.CostType === 0;
       const item = {
+        id: cost.ID,
         name: cost.Description || 'Unknown',
         chargeCode: cost.ChargeCode ?? '',
         billingType: hourly ? 'HOURLY' : 'FIXED_AMOUNT',
         taxType: cost.UnitChargeTaxCode === 'GST' || cost.UnitChargeTaxRate > 0 ? 'GST' : 'GST_FREE',
-        rate: Math.round((cost.UnitChargeAmtExTax ?? 0) * 100),
+        rate: Math.round((cost.UnitChargeAmt ?? 0) * 100),
         quantity: hourly ? Math.round((cost.Quantity ?? 0) * 60) : Math.round(cost.Quantity ?? 0),
         billingTemplateInstanceId: estimate.ID,
         createdAt: formatDate(cost.StartDate) || createdAt,
@@ -134,6 +136,29 @@ function buildBillingTemplates(caseId, endpoints) {
     };
     if (expiryDate) template.expiryDate = expiryDate;
     return template;
+  });
+}
+
+// Logged costs from /CaseCost/GetData. EstimateCostID links a cost to the
+// estimate cost row it was logged against (= billing template item id);
+// costs without one are kept but need special handling at upload time.
+// UnitChargeAmt/TotalCharge include GST, which matches NotusPoint's
+// convention (invoicing extracts GST from the total), so dollars -> cents
+// as-is. employeeId is the Case Manager ID; the uploader resolves it to a
+// NotusPoint user created by the staff import.
+function buildCosts(endpoints) {
+  return (endpoints?.['/CaseCost/GetData'] ?? []).map(cost => {
+    const hourly = cost.CostType === 0;
+    return {
+      status: cost.IsInvoiced ? 'INVOICED' : 'LOGGED',
+      quantity: hourly ? Math.round((cost.Quantity ?? 0) * 60) : Math.round(cost.Quantity ?? 0),
+      rate: Math.round((cost.UnitChargeAmt ?? 0) * 100),
+      total: Math.round((cost.TotalCharge ?? 0) * 100),
+      billingInstanceItemId: nullId(cost.EstimateCostID) ? '' : cost.EstimateCostID,
+      employeeId: nullId(cost.EmployeeID) ? '' : cost.EmployeeID,
+      date: formatDate(cost.ReferenceDate),
+      createdAt: formatDate(cost.ReferenceDate),
+    };
   });
 }
 
@@ -217,6 +242,10 @@ function saveStructuredData(data, lookups, employeeList) {
     };
 
     const billingTemplates = buildBillingTemplates(caseId, caseData.endpoints);
+    const costs = buildCosts(caseData.endpoints);
+    for (const cost of costs) {
+      if (cost.employeeId) usedEmployeeIds.add(cost.employeeId);
+    }
 
     cases.push({
       caseId,
@@ -247,6 +276,7 @@ function saveStructuredData(data, lookups, employeeList) {
       conditionId,
       conditionDescription,
       billingTemplates,
+      costs,
     });
   }
 

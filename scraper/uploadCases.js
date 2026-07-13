@@ -42,6 +42,39 @@ function toStaffImportDto(employee) {
   return dto;
 }
 
+// Costs can only import against a billing template item in the same payload;
+// anything unlinked in the source (or linked to a deleted estimate row) is
+// skipped and reported. employeeId is the Case Manager ID, resolved to the
+// user the staff import created.
+function toCostImportDtos(caseRecord, resolvedUserIdByEmployeeId) {
+  const itemIds = new Set(
+    (caseRecord.billingTemplates ?? []).flatMap((t) => t.items.map((i) => i.id)),
+  );
+  const costs = [];
+  let skipped = 0;
+
+  for (const cost of caseRecord.costs ?? []) {
+    if (!itemIds.has(cost.billingInstanceItemId)) {
+      skipped++;
+      continue;
+    }
+    const dto = {
+      status: cost.status,
+      quantity: cost.quantity,
+      rate: cost.rate,
+      total: cost.total,
+      billingInstanceItemId: cost.billingInstanceItemId,
+      date: cost.date,
+      createdAt: cost.createdAt,
+    };
+    const userId = resolvedUserIdByEmployeeId.get(cost.employeeId);
+    if (userId) dto.userId = userId;
+    costs.push(dto);
+  }
+
+  return { costs, skipped };
+}
+
 function toCaseImportDto(caseRecord, resolvedEmailByEmployeeId) {
   const address = caseRecord.clientAddress || {};
   const referrer = caseRecord.referrer || {};
@@ -107,6 +140,9 @@ async function uploadStaff(dto) {
       `${res.status} ${res.statusText}${body ? ` - ${body}` : ""}`,
     );
   }
+
+  // The created user; its id is needed to link costs to their logging user
+  return res.json();
 }
 
 async function uploadCase(dto) {
@@ -162,6 +198,7 @@ async function uploadCaseFile(caseId, entry) {
 
   const failedStaff = [];
   const resolvedEmailByEmployeeId = new Map();
+  const resolvedUserIdByEmployeeId = new Map();
   let staffDone = 0;
 
   for (const employee of employees) {
@@ -172,7 +209,8 @@ async function uploadCaseFile(caseId, entry) {
 
     try {
       process.stderr.write(`${progress} Uploading staff ${dto.email}... `);
-      await uploadStaff(dto);
+      const user = await uploadStaff(dto);
+      if (user?.id) resolvedUserIdByEmployeeId.set(employee.id, user.id);
       console.error("done");
     } catch (err) {
       console.error(`FAILED: ${err.message}`);
@@ -196,6 +234,17 @@ async function uploadCaseFile(caseId, entry) {
     done++;
     const progress = `[${done}/${cases.length}]`;
     const dto = toCaseImportDto(caseRecord, resolvedEmailByEmployeeId);
+
+    const { costs, skipped } = toCostImportDtos(
+      caseRecord,
+      resolvedUserIdByEmployeeId,
+    );
+    if (costs.length) dto.costs = costs;
+    if (skipped) {
+      console.error(
+        `    ${skipped} cost(s) on case ${dto.caseId} not linked to an estimate item - skipped`,
+      );
+    }
 
     try {
       process.stderr.write(`${progress} Uploading case ${dto.caseId}... `);

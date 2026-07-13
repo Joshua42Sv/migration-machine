@@ -89,6 +89,27 @@ async function getCaseEstimateData(context, token, caseId, estimateId) {
   return res.json();
 }
 
+async function getCaseCosts(context, token, caseId) {
+  const res = await context.request.post(`${BASE_URL}/CaseCost/_List`, {
+    headers: buildHeaders(token, 'application/x-www-form-urlencoded; charset=UTF-8'),
+    form: { caseNumber: caseId },
+  });
+  const text = await res.text();
+  // Mirrors /CaseEstimate/_List, which 500s with a plain-text message when there is no data
+  if (!res.ok() && /there are no/i.test(text)) return [];
+  if (!res.ok()) throw new Error(`/CaseCost/_List ${res.status()}: ${text.slice(0, 100)}`);
+  const body = JSON.parse(text);
+  return body.data ?? [];
+}
+
+async function getCaseCostData(context, token, caseId, costId) {
+  const res = await context.request.post(`${BASE_URL}/CaseCost/GetData`, {
+    headers: buildHeaders(token, 'application/json; charset=UTF-8'),
+    data: { component: 'case', caseNumber: caseId, tabID: 'costs', ID: costId },
+  });
+  return res.json();
+}
+
 async function getAllLookups(context, token) {
   const lookups = {};
   for (const type of LOOKUP_TYPES) {
@@ -132,6 +153,15 @@ async function captureCase(context, token, caseId) {
   }
   endpoints['/CaseEstimate/GetData'] = estimateDetails;
 
+  const costList = await getCaseCosts(context, token, caseId);
+  endpoints['/CaseCost/_List'] = [costList];
+  const costDetails = [];
+  for (const cost of costList) {
+    if (!cost.ID) continue;
+    costDetails.push(await getCaseCostData(context, token, caseId, cost.ID));
+  }
+  endpoints['/CaseCost/GetData'] = costDetails;
+
   return endpoints;
 }
 
@@ -164,6 +194,6 @@ async function downloadDocumentFile(context, documentId) {
 module.exports = {
   login, getCaseData, getCaseContacts, getCaseContactData, getLookupList, getAllLookups,
   getEmployeeList, captureCase,
-  getCaseEstimates, getCaseEstimateData,
+  getCaseEstimates, getCaseEstimateData, getCaseCosts, getCaseCostData,
   getCaseDocuments, downloadDocumentFile, getCaseDocumentData, LOOKUP_TYPES,
 };
