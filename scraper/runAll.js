@@ -83,7 +83,8 @@ function buildAddress(map, { street, suburb, postalCode, regionId, countryId }) 
 // not reliable - grouping rows reuse 0), rows with a Cost payload are the
 // billable line items, possibly nested under grouping rows. NotusPoint money
 // is GST-INCLUSIVE cents (invoicing extracts GST from totals), so rates come
-// from UnitChargeAmt as-is; hourly quantities (CostType 0) are hours -> minutes.
+// from UnitChargeAmt as-is; hourly quantities (CostType 0) are decimal hours
+// in Case Manager and seconds in the NotusPoint importer.
 function buildBillingTemplates(caseId, endpoints) {
   const estimateList = endpoints?.['/CaseEstimate/_List']?.[0] ?? [];
   const itemsByEstimateId = {};
@@ -117,7 +118,7 @@ function buildBillingTemplates(caseId, endpoints) {
         billingType: hourly ? 'HOURLY' : 'FIXED_AMOUNT',
         taxType: cost.UnitChargeTaxCode === 'GST' || cost.UnitChargeTaxRate > 0 ? 'GST' : 'GST_FREE',
         rate: Math.round((cost.UnitChargeAmt ?? 0) * 100),
-        quantity: hourly ? Math.round((cost.Quantity ?? 0) * 60) : Math.round(cost.Quantity ?? 0),
+        quantity: hourly ? Math.round((cost.Quantity ?? 0) * 3600) : Math.round(cost.Quantity ?? 0),
         billingTemplateInstanceId: estimate.ID,
         createdAt: formatDate(cost.StartDate) || createdAt,
       };
@@ -144,14 +145,15 @@ function buildBillingTemplates(caseId, endpoints) {
 // costs without one are kept but need special handling at upload time.
 // UnitChargeAmt/TotalCharge include GST, which matches NotusPoint's
 // convention (invoicing extracts GST from the total), so dollars -> cents
-// as-is. employeeId is the Case Manager ID; the uploader resolves it to a
-// NotusPoint user created by the staff import.
+// as-is. Hourly quantities are converted from Case Manager decimal hours to
+// NotusPoint seconds. employeeId is the Case Manager ID; the uploader resolves
+// it to a NotusPoint user created by the staff import.
 function buildCosts(endpoints) {
   return (endpoints?.['/CaseCost/GetData'] ?? []).map(cost => {
     const hourly = cost.CostType === 0;
     return {
       status: cost.IsInvoiced ? 'INVOICED' : 'LOGGED',
-      quantity: hourly ? Math.round((cost.Quantity ?? 0) * 60) : Math.round(cost.Quantity ?? 0),
+      quantity: hourly ? Math.round((cost.Quantity ?? 0) * 3600) : Math.round(cost.Quantity ?? 0),
       rate: Math.round((cost.UnitChargeAmt ?? 0) * 100),
       total: Math.round((cost.TotalCharge ?? 0) * 100),
       billingInstanceItemId: nullId(cost.EstimateCostID) ? '' : cost.EstimateCostID,

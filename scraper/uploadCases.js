@@ -48,7 +48,9 @@ function toStaffImportDto(employee) {
 // user the staff import created.
 function toCostImportDtos(caseRecord, resolvedUserIdByEmployeeId) {
   const itemIds = new Set(
-    (caseRecord.billingTemplates ?? []).flatMap((t) => t.items.map((i) => i.id)),
+    (caseRecord.billingTemplates ?? []).flatMap((t) =>
+      t.items.map((i) => i.id),
+    ),
   );
   const costs = [];
   let skipped = 0;
@@ -105,8 +107,8 @@ function toCaseImportDto(caseRecord, resolvedEmailByEmployeeId) {
       fax: referrer.fax || "",
       position: referrer.position || "",
     },
-    customerId: "cefc5f16-9c6e-4580-996b-9e881a2e7bb2", // TODO: Replace with actual customer ID, mapped from old to new
-    requirementId: "ad641c36-2992-4d31-8cdc-5b8890a81427", // TODO: Replace with actual requirement ID, mapped from old to new
+    customerId: "b6db684c-1bfa-479d-93ad-0d6d4402966a", // TODO: Replace with actual customer ID, mapped from old to new
+    requirementId: "64360683-a5bd-4262-b82f-12800e9f96b9", // TODO: Replace with actual requirement ID, mapped from old to new
   };
 
   if (caseRecord.clientBillingAddress) {
