@@ -2,7 +2,9 @@ require('dotenv').config();
 const { chromium } = require('playwright');
 const fs = require('fs');
 const path = require('path');
-const { login, getCaseDocuments, downloadDocumentFile, getCaseDocumentData } = require('./lib/apiClient');
+const {
+  login, getCaseDocuments, downloadDocumentFile, downloadDocumentAttachment, getCaseDocumentData,
+} = require('./lib/apiClient');
 
 const USERNAME = process.env.CM_USER || '';
 const PASSWORD = process.env.CM_PASS || '';
@@ -42,24 +44,83 @@ function uniquePath(dir, filename) {
   return candidate;
 }
 
-function buildEml(doc) {
-  const lines = [];
-  if (doc.From) lines.push(`From: ${doc.From}`);
-  if (doc.To) lines.push(`To: ${doc.To}`);
-  if (doc.CC) lines.push(`Cc: ${doc.CC}`);
-  if (doc.BCC) lines.push(`Bcc: ${doc.BCC}`);
-  lines.push(`Subject: ${doc.Title ?? ''}`);
-  lines.push(`Date: ${new Date(doc.DateCreated).toUTCString()}`);
-  lines.push('MIME-Version: 1.0');
-  lines.push('Content-Type: text/html; charset="UTF-8"');
-  lines.push('');
-  lines.push(doc.HtmlDoc ?? '');
+const ATTACHMENT_MIME_TYPES = {
+  '.pdf': 'application/pdf',
+  '.doc': 'application/msword',
+  '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  '.xls': 'application/vnd.ms-excel',
+  '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.png': 'image/png',
+  '.gif': 'image/gif',
+  '.txt': 'text/plain',
+  '.html': 'text/html',
+  '.eml': 'message/rfc822',
+};
+
+function attachmentMimeType(filename) {
+  return ATTACHMENT_MIME_TYPES[path.extname(filename).toLowerCase()] ?? 'application/octet-stream';
+}
+
+// attachments: [{ filename, buffer }]. With attachments the email becomes a
+// multipart/mixed MIME message (HTML body part + base64 attachment parts) so
+// the .eml opens in any mail client with its attachments intact.
+function buildEml(doc, attachments = []) {
+  const headers = [];
+  if (doc.From) headers.push(`From: ${doc.From}`);
+  if (doc.To) headers.push(`To: ${doc.To}`);
+  if (doc.CC) headers.push(`Cc: ${doc.CC}`);
+  if (doc.BCC) headers.push(`Bcc: ${doc.BCC}`);
+  headers.push(`Subject: ${doc.Title ?? ''}`);
+  headers.push(`Date: ${new Date(doc.DateCreated).toUTCString()}`);
+  headers.push('MIME-Version: 1.0');
+
+  if (!attachments.length) {
+    headers.push('Content-Type: text/html; charset="UTF-8"');
+    return [...headers, '', doc.HtmlDoc ?? ''].join('\r\n');
+  }
+
+  const boundary = `=_cm_${Math.random().toString(16).slice(2)}`;
+  const lines = [
+    ...headers,
+    `Content-Type: multipart/mixed; boundary="${boundary}"`,
+    '',
+    'This is a multi-part message in MIME format.',
+    '',
+    `--${boundary}`,
+    'Content-Type: text/html; charset="UTF-8"',
+    '',
+    doc.HtmlDoc ?? '',
+    '',
+  ];
+  for (const att of attachments) {
+    const filename = att.filename.replace(/"/g, "'");
+    lines.push(
+      `--${boundary}`,
+      `Content-Type: ${attachmentMimeType(filename)}; name="${filename}"`,
+      `Content-Disposition: attachment; filename="${filename}"`,
+      'Content-Transfer-Encoding: base64',
+      '',
+      att.buffer.toString('base64').replace(/(.{76})/g, '$1\r\n'),
+      '',
+    );
+  }
+  lines.push(`--${boundary}--`, '');
   return lines.join('\r\n');
 }
 
 function buildHtml(doc) {
   const body = doc.HtmlDoc || `<pre>${doc.Details ?? ''}</pre>`;
   return `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>${doc.Title ?? ''}</title></head><body>${body}</body></html>`;
+}
+
+// After Ctrl+C (or a crash) Playwright closes the browser but the loop keeps
+// running; every remaining request fails with one of these. Treat them as
+// fatal so we abort instead of logging hundreds of failures and writing a
+// junk manifest.
+function isBrowserGone(err) {
+  return /browser has been closed|Request context disposed/i.test(err.message ?? '');
 }
 
 const IMAGE_EXTENSIONS = new Set(['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.tif', '.webp']);
@@ -79,11 +140,23 @@ function classifyFileType(doc) {
 
 async function downloadNonFileDoc(context, token, caseId, doc) {
   const data = await getCaseDocumentData(context, token, caseId, doc.ID);
-  if (data.Attachments?.length > 0) {
-    console.error(`  note: ${doc.Title} has ${data.Attachments.length} attachment(s) not yet handled`);
-  }
   if (doc.FileExtension === '.eml') {
-    return { buffer: Buffer.from(buildEml(data), 'utf8'), filename: `${data.Title}.eml` };
+    // A failed attachment shouldn't lose the email itself; build the .eml
+    // with whatever downloaded and report the rest
+    const attachments = [];
+    for (const att of data.Attachments ?? []) {
+      try {
+        const { buffer } = await downloadDocumentAttachment(context, att.DocumentID, att.AttachmentID);
+        attachments.push({ filename: att.ItemValue || att.AttachmentID, buffer });
+      } catch (err) {
+        if (isBrowserGone(err)) throw err;
+        console.error(`  attachment "${att.ItemValue}" on "${doc.Title}" FAILED: ${err.message}`);
+      }
+    }
+    return { buffer: Buffer.from(buildEml(data, attachments), 'utf8'), filename: `${data.Title}.eml` };
+  }
+  if (data.Attachments?.length > 0) {
+    console.error(`  note: ${doc.Title} has ${data.Attachments.length} attachment(s) - only embeddable in emails, skipped`);
   }
   return { buffer: Buffer.from(buildHtml(data), 'utf8'), filename: `${data.Title}.html` };
 }
@@ -121,7 +194,13 @@ async function downloadNonFileDoc(context, token, caseId, doc) {
       // regardless, listing what succeeded, so the upload step always has it
       const manifest = [];
       const failedDocs = [];
+      let docIndex = 0;
       for (const doc of documents) {
+        docIndex++;
+        const title = (doc.Title ?? doc.ID).slice(0, 60);
+        process.stderr.write(
+          `\r  [${docIndex}/${documents.length}] ${title}`.padEnd(80) + '\r',
+        );
         try {
           const { buffer, filename } = doc.IsFile
             ? await downloadDocumentFile(context, doc.ID)
@@ -136,16 +215,22 @@ async function downloadNonFileDoc(context, token, caseId, doc) {
             dateUploaded: doc.DateCreated ?? '',
           });
         } catch (err) {
+          if (isBrowserGone(err)) throw err;
           failedDocs.push({ id: doc.ID, title: doc.Title ?? '', error: err.message });
-          console.error(`  document "${doc.Title ?? doc.ID}" FAILED: ${err.message}`);
+          console.error(`\n  document "${doc.Title ?? doc.ID}" FAILED: ${err.message}`);
         }
       }
+      process.stderr.write(''.padEnd(80) + '\r');
       fs.writeFileSync(path.join(caseDir, 'manifest.json'), JSON.stringify(manifest, null, 2));
       console.error(
         `${progress} Case ${caseId}: saved ${manifest.length}/${documents.length} document(s)` +
           (failedDocs.length ? `, ${failedDocs.length} FAILED` : ''),
       );
     } catch (err) {
+      if (isBrowserGone(err)) {
+        console.error(`\nAborted: the browser was closed mid-run (Ctrl+C?). No manifest written for case ${caseId}; re-run to get a complete download.`);
+        process.exit(1);
+      }
       console.error(`${progress} Case ${caseId} FAILED: ${err.message}`);
     }
   }

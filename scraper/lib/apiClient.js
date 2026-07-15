@@ -191,9 +191,26 @@ async function downloadDocumentFile(context, documentId) {
   return { buffer, filename, contentType: res.headers()['content-type'] };
 }
 
+// Attachments on in-app documents (emails/notes) need both IDs as query params;
+// the path-parameter form used by GetFile errors on this endpoint
+async function downloadDocumentAttachment(context, documentId, attachmentId) {
+  const res = await context.request.get(`${BASE_URL}/CaseDocument/GetAttachment/`, {
+    params: { documentID: documentId, attachmentID: attachmentId },
+  });
+  if (!res.ok()) {
+    throw new Error(`GetAttachment ${res.status()} ${res.statusText()}`);
+  }
+  const buffer = await res.body();
+  const disposition = res.headers()['content-disposition'] || '';
+  const match = disposition.match(/filename="?([^"]+)"?/);
+  const filename = match ? match[1] : attachmentId;
+  return { buffer, filename, contentType: res.headers()['content-type'] };
+}
+
 module.exports = {
   login, getCaseData, getCaseContacts, getCaseContactData, getLookupList, getAllLookups,
   getEmployeeList, captureCase,
   getCaseEstimates, getCaseEstimateData, getCaseCosts, getCaseCostData,
-  getCaseDocuments, downloadDocumentFile, getCaseDocumentData, LOOKUP_TYPES,
+  getCaseDocuments, downloadDocumentFile, downloadDocumentAttachment, getCaseDocumentData,
+  LOOKUP_TYPES,
 };
