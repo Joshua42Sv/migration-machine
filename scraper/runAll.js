@@ -119,6 +119,9 @@ function buildBillingTemplates(caseId, endpoints) {
         taxType: cost.UnitChargeTaxCode === 'GST' || cost.UnitChargeTaxRate > 0 ? 'GST' : 'GST_FREE',
         rate: Math.round((cost.UnitChargeAmt ?? 0) * 100),
         quantity: hourly ? Math.round((cost.Quantity ?? 0) * 3600) : Math.round(cost.Quantity ?? 0),
+        // CM's stored line total; saved verbatim so NotusPoint matches to
+        // the cent instead of re-deriving from the rounded rate/quantity
+        total: Math.round((cost.TotalCharge ?? 0) * 100),
         billingTemplateInstanceId: estimate.ID,
         createdAt: formatDate(cost.StartDate) || createdAt,
       };
@@ -177,7 +180,6 @@ function saveStructuredData(data, lookups, employeeList) {
   const statusesMap = {};
   const categoriesMap = {};
   const requirementsMap = {};
-  const usedEmployeeIds = new Set();
 
   for (const [caseId, caseData] of Object.entries(data)) {
     if (caseData.error) continue;
@@ -190,7 +192,11 @@ function saveStructuredData(data, lookups, employeeList) {
 
     const caseInfo = caseData.endpoints?.['/Case/GetData']?.[0] ?? {};
     const titlePart = client.ContactName?.split(', ')[2] ?? '';
-    const contactInfo = caseData.endpoints?.['/CaseContact/GetData']?.[0]?.ContactInfo ?? {};
+    const contactDetails = caseData.endpoints?.['/CaseContact/GetData'] ?? [];
+    const contactInfoById = new Map(
+      contactDetails.map(detail => [detail.ID, detail.ContactInfo ?? {}]),
+    );
+    const contactInfo = contactInfoById.get(client.ID) ?? {};
     const referrerInfo = caseData.endpoints?.referrerContact?.[0]?.ContactInfo ?? {};
 
     const causeId = nullId(caseInfo.CauseID) ? '' : caseInfo.CauseID;
@@ -217,7 +223,6 @@ function saveStructuredData(data, lookups, employeeList) {
     const assignedUser = employeeMap[assignedUserId];
     const assignedUserName = assignedUser ? `${assignedUser.firstName} ${assignedUser.lastName}`.trim() : '';
     const assignedUserEmail = assignedUser?.email ?? '';
-    if (assignedUserId) usedEmployeeIds.add(assignedUserId);
 
     const clientAddress = buildAddress(lookup, {
       street: contactInfo.Street,
@@ -246,20 +251,54 @@ function saveStructuredData(data, lookups, employeeList) {
       position: resolveId(lookup, referrerInfo.PositionID),
     };
 
+    // Client and Referrer already migrate as first-class records; QA and
+    // Workcom Admin are internal contacts that aren't wanted in NotusPoint
+    const EXCLUDED_CONTACT_ROLES = new Set(['Client', 'Referrer', 'QA', 'Workcom Admin']);
+    const caseContacts = [];
+    for (const row of contactList) {
+      const roles = (row.RoleNames ?? '').split(',').map(r => r.trim()).filter(Boolean);
+      if (roles.some(role => EXCLUDED_CONTACT_ROLES.has(role))) continue;
+
+      const detail = contactInfoById.get(row.ID) ?? {};
+      caseContacts.push({
+        firstName: detail.FirstName || row.FirstName || '',
+        lastName: detail.LastName || row.LastName || '',
+        email: detail.Email1 || row.Email || '',
+        company: detail.CompanyName || row.CompanyName || '',
+        phone: detail.Mobile || detail.Phone1 || detail.Phone2 || row.Phone || '',
+        fax: detail.Fax || '',
+        role: row.PrimaryRoleName || roles[0] || '',
+        address: buildAddress(lookup, {
+          street: detail.Street,
+          suburb: detail.Suburb,
+          postalCode: detail.PostalCode,
+          regionId: detail.RegionID,
+          countryId: detail.CountryID,
+        }),
+      });
+    }
+
     const billingTemplates = buildBillingTemplates(caseId, caseData.endpoints);
     const costs = buildCosts(caseData.endpoints);
-    for (const cost of costs) {
-      if (cost.employeeId) usedEmployeeIds.add(cost.employeeId);
-    }
+
+    // Client detail lives on ContactInfo (from /CaseContact/GetData), not the
+    // _List row - the row's Phone is often blank while ContactInfo.Mobile is set
+    const genderToSex = { M: 'male', F: 'female' };
 
     cases.push({
       caseId,
       clientTitle: titlePart,
       clientFirstName: client.FirstName ?? '',
       clientLastName: client.LastName ?? '',
-      clientEmail: client.Email ?? '',
-      clientPhone: client.Phone ?? '',
+      clientEmail: contactInfo.Email1 || client.Email || '',
+      clientPhone: contactInfo.Mobile || contactInfo.Phone1 || contactInfo.Phone2 || client.Phone || '',
+      clientLandline: contactInfo.Phone1 || contactInfo.Phone2 || '',
+      clientSecondaryEmail: contactInfo.Email2 || '',
+      clientDateOfBirth: formatDate(contactInfo.DateOfBirth),
+      clientSex: genderToSex[contactInfo.Gender] ?? (contactInfo.Gender ? 'other' : ''),
       claimNumber: caseInfo.ClaimNo ?? '',
+      billerCode: caseInfo.BillerCode ?? '',
+      conditionDate: formatDate(caseInfo.ConditionDate),
       referralDate: formatDate(caseInfo.DateOfReferral),
       dateClosed: formatDate(caseInfo.DateClosed),
       statusId,
@@ -274,6 +313,7 @@ function saveStructuredData(data, lookups, employeeList) {
       clientAddress,
       clientBillingAddress,
       referrer,
+      caseContacts,
       employmentStatusId,
       employmentStatusDescription,
       causeId,
@@ -291,8 +331,10 @@ function saveStructuredData(data, lookups, employeeList) {
   const statuses = Object.entries(statusesMap).map(([id, description]) => ({ id, description }));
   const categories = Object.entries(categoriesMap).map(([id, description]) => ({ id, description }));
   const requirements = Object.entries(requirementsMap).map(([id, description]) => ({ id, description }));
+  // All employees, not just the ones referenced by cases: document creators
+  // (manifest createdById) are only known after downloadDocuments.js runs, so
+  // uploadCases.js filters to the employees actually referenced at upload time
   const employees = Object.entries(employeeMap)
-    .filter(([id]) => usedEmployeeIds.has(id))
     .map(([id, employee]) => ({ id, ...employee }));
 
   fs.writeFileSync(STRUCTURED_FILE, JSON.stringify({ cases, causes, conditions, employmentStatuses, statuses, categories, requirements, employees }, null, 2));

@@ -132,16 +132,19 @@ async function captureCase(context, token, caseId) {
   const contactRows = Array.isArray(contacts?.data) ? contacts.data : [];
   const hasRole = (row, role) => (row.RoleNames ?? '').split(',').map(r => r.trim()).includes(role);
 
-  const client = contactRows.find(c => c.PrimaryRoleName === 'Client');
-  if (client) {
-    const contactDetail = await getCaseContactData(context, token, caseId, client.ID);
-    endpoints['/CaseContact/GetData'] = [contactDetail];
+  // Full detail (ContactInfo: phones, emails, address, DOB, ...) for every
+  // contact; consumers pick records out by case contact ID
+  const contactDetails = [];
+  for (const row of contactRows) {
+    if (!row.ID) continue;
+    contactDetails.push(await getCaseContactData(context, token, caseId, row.ID));
   }
+  endpoints['/CaseContact/GetData'] = contactDetails;
 
   const referrer = contactRows.find(c => hasRole(c, 'Referrer'));
   if (referrer) {
-    const contactDetail = await getCaseContactData(context, token, caseId, referrer.ID);
-    endpoints['referrerContact'] = [contactDetail];
+    const contactDetail = contactDetails.find(cd => cd.ID === referrer.ID);
+    if (contactDetail) endpoints['referrerContact'] = [contactDetail];
   }
 
   const estimateList = await getCaseEstimates(context, token, caseId);

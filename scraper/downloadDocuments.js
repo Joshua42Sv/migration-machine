@@ -123,6 +123,8 @@ function isBrowserGone(err) {
   return /browser has been closed|Request context disposed/i.test(err.message ?? '');
 }
 
+const NIL_ID = '00000000-0000-0000-0000-000000000000';
+
 const IMAGE_EXTENSIONS = new Set(['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.tif', '.webp']);
 const WORD_EXTENSIONS = new Set(['.doc', '.docx']);
 const EXCEL_EXTENSIONS = new Set(['.xls', '.xlsx']);
@@ -138,8 +140,9 @@ function classifyFileType(doc) {
   return 'CASE_NOTE';
 }
 
-async function downloadNonFileDoc(context, token, caseId, doc) {
-  const data = await getCaseDocumentData(context, token, caseId, doc.ID);
+// data is the /CaseDocument/GetData record, fetched once per document in the
+// main loop (it also carries CreatedByID for the manifest)
+async function buildNonFileDoc(context, doc, data) {
   if (doc.FileExtension === '.eml') {
     // A failed attachment shouldn't lose the email itself; build the .eml
     // with whatever downloaded and report the rest
@@ -202,13 +205,18 @@ async function downloadNonFileDoc(context, token, caseId, doc) {
           `\r  [${docIndex}/${documents.length}] ${title}`.padEnd(80) + '\r',
         );
         try {
+          const data = await getCaseDocumentData(context, token, caseId, doc.ID);
           const { buffer, filename } = doc.IsFile
             ? await downloadDocumentFile(context, doc.ID)
-            : await downloadNonFileDoc(context, token, caseId, doc);
+            : await buildNonFileDoc(context, doc, data);
           const safeName = uniquePath(caseDir, sanitizeFilename(filename));
           fs.writeFileSync(path.join(caseDir, safeName), buffer);
+          const createdById = data.CreatedByID && data.CreatedByID !== NIL_ID
+            ? data.CreatedByID
+            : '';
           manifest.push({
             documentId: doc.ID,
+            createdById,
             filename: safeName,
             title: doc.Title ?? safeName,
             fileType: classifyFileType(doc),

@@ -2,8 +2,13 @@ require("dotenv").config();
 const fs = require("fs");
 const path = require("path");
 
+const args = process.argv.slice(2);
+// --skip-files: upload cases and costs only; costs then import without file
+// links, so only use this for quick data-checking runs
+const SKIP_FILES = args.includes("--skip-files");
 const STRUCTURED_FILE =
-  process.argv[2] || path.join(__dirname, "structuredData.json");
+  args.find((a) => !a.startsWith("--")) ||
+  path.join(__dirname, "structuredData.json");
 const DOCUMENTS_DIR = path.join(__dirname, "documents");
 const IMPORT_URL =
   process.env.IMPORT_URL || "http://localhost:8080/api/importer/case";
@@ -14,7 +19,6 @@ const IMPORT_STAFF_URL =
 const IMPORT_COSTS_URL =
   process.env.IMPORT_COSTS_URL ||
   "http://localhost:8080/api/importer/case/costs";
-const UPLOADED_BY_ID = "b39312ed-4baf-4904-b21b-72df55345d62"; // TODO: Replace with actual user ID, mapped from old to new
 
 if (!fs.existsSync(STRUCTURED_FILE)) {
   console.error(`Structured data file not found: ${STRUCTURED_FILE}`);
@@ -126,8 +130,57 @@ function toCaseImportDto(caseRecord, resolvedEmailByEmployeeId) {
     requirementId: "64360683-a5bd-4262-b82f-12800e9f96b9", // TODO: Replace with actual requirement ID, mapped from old to new
   };
 
+  // Status text ("Open") maps onto NotusPoint's CaseStatus enum; the importer
+  // rejects values it doesn't recognise rather than guessing
+  if (caseRecord.statusDescription) dto.status = caseRecord.statusDescription;
+  if (caseRecord.billerCode) dto.billerCode = caseRecord.billerCode;
+  if (caseRecord.conditionDate) dto.conditionDate = caseRecord.conditionDate;
+  // Lookup descriptions from Case Manager; the importer matches them against
+  // the configurable lists (case-insensitively) or creates new entries
+  if (caseRecord.causeDescription) dto.cause = caseRecord.causeDescription;
+  if (caseRecord.conditionDescription) {
+    dto.condition = caseRecord.conditionDescription;
+  }
+  if (caseRecord.employmentStatusDescription) {
+    dto.employmentStatus = caseRecord.employmentStatusDescription;
+  }
+
+  if (caseRecord.clientDateOfBirth) {
+    dto.clientDateOfBirth = caseRecord.clientDateOfBirth;
+  }
+  if (caseRecord.clientSex) dto.clientSex = caseRecord.clientSex;
+  if (caseRecord.clientLandline) dto.clientLandline = caseRecord.clientLandline;
+  if (caseRecord.clientSecondaryEmail) {
+    dto.clientSecondaryEmail = caseRecord.clientSecondaryEmail;
+  }
+
   if (caseRecord.clientBillingAddress) {
     dto.clientBillingAddress = caseRecord.clientBillingAddress;
+  }
+
+  if (caseRecord.caseContacts?.length) {
+    // Truncation matches NotusPoint's column lengths (phone/fax 20, most
+    // text 100, address lines 200)
+    const cut = (value, max) => (value || "").slice(0, max);
+    dto.contacts = caseRecord.caseContacts.map((c) => {
+      const contact = {
+        firstName: cut(c.firstName, 100) || "Unknown",
+        lastName: cut(c.lastName, 100) || "Unknown",
+        email: cut(c.email, 100) || "unknown@example.com",
+      };
+      if (c.company) contact.company = cut(c.company, 100);
+      if (c.phone) contact.phone = cut(c.phone, 20);
+      if (c.fax) contact.fax = cut(c.fax, 20);
+      if (c.role) contact.role = c.role;
+      const address = c.address ?? {};
+      if (address.addressLine1) contact.addressLine1 = cut(address.addressLine1, 200);
+      if (address.addressLine2) contact.addressLine2 = cut(address.addressLine2, 200);
+      if (address.suburb) contact.suburb = cut(address.suburb, 100);
+      if (address.postcode) contact.postcode = cut(address.postcode, 20);
+      if (address.state) contact.state = cut(address.state, 100);
+      if (address.country) contact.country = cut(address.country, 100);
+      return contact;
+    });
   }
 
   if (caseRecord.billingTemplates?.length) {
@@ -183,7 +236,7 @@ function loadManifest(caseId) {
   return JSON.parse(fs.readFileSync(manifestPath, "utf8"));
 }
 
-async function uploadCaseFile(caseId, entry) {
+async function uploadCaseFile(caseId, entry, uploadedById) {
   const filePath = path.join(DOCUMENTS_DIR, caseId, entry.filename);
   const buffer = fs.readFileSync(filePath);
 
@@ -192,7 +245,7 @@ async function uploadCaseFile(caseId, entry) {
   form.append("caseId", caseId);
   form.append("title", entry.title);
   form.append("fileType", entry.fileType);
-  form.append("uploadedById", UPLOADED_BY_ID);
+  form.append("uploadedById", uploadedById);
   form.append("dateUploaded", entry.dateUploaded || new Date().toISOString());
 
   const res = await fetch(IMPORT_FILE_URL, { method: "POST", body: form });
@@ -228,7 +281,26 @@ async function uploadCosts(caseId, costs) {
     fs.readFileSync(STRUCTURED_FILE, "utf8"),
   );
 
-  console.error(`Total: ${employees.length} staff to upload`);
+  // Only employees actually referenced somewhere become NotusPoint users:
+  // cost loggers, assigned case users, and document creators (from the
+  // manifests, so files can be uploaded as the user who created them)
+  const neededEmployeeIds = new Set();
+  for (const caseRecord of cases) {
+    if (caseRecord.assignedUserId) {
+      neededEmployeeIds.add(caseRecord.assignedUserId);
+    }
+    for (const cost of caseRecord.costs ?? []) {
+      if (cost.employeeId) neededEmployeeIds.add(cost.employeeId);
+    }
+    for (const entry of loadManifest(caseRecord.caseId)) {
+      if (entry.createdById) neededEmployeeIds.add(entry.createdById);
+    }
+  }
+  const staff = employees.filter((e) => neededEmployeeIds.has(e.id));
+
+  console.error(
+    `Total: ${staff.length} staff to upload (${employees.length - staff.length} unreferenced employee(s) skipped)`,
+  );
   console.error(`Target: ${IMPORT_STAFF_URL}\n`);
 
   const failedStaff = [];
@@ -236,9 +308,9 @@ async function uploadCosts(caseId, costs) {
   const resolvedUserIdByEmployeeId = new Map();
   let staffDone = 0;
 
-  for (const employee of employees) {
+  for (const employee of staff) {
     staffDone++;
-    const progress = `[${staffDone}/${employees.length}]`;
+    const progress = `[${staffDone}/${staff.length}]`;
     const dto = toStaffImportDto(employee);
     resolvedEmailByEmployeeId.set(employee.id, dto.email);
 
@@ -258,7 +330,11 @@ async function uploadCosts(caseId, costs) {
   );
 
   console.error(`Total: ${cases.length} cases to upload`);
-  console.error(`Target: ${IMPORT_URL}\n`);
+  console.error(`Target: ${IMPORT_URL}`);
+  if (SKIP_FILES) {
+    console.error("--skip-files: file uploads disabled, costs will have no file links");
+  }
+  console.error("");
 
   const failed = [];
   const failedFiles = [];
@@ -283,12 +359,22 @@ async function uploadCosts(caseId, costs) {
       continue;
     }
 
+    // Each file uploads as the user who created the document in Case
+    // Manager; when that can't be resolved (no createdById, or the staff
+    // upload failed) fall back to the case's assigned user, then any
+    // imported staff member
+    const fallbackUploaderId =
+      resolvedUserIdByEmployeeId.get(caseRecord.assignedUserId) ||
+      resolvedUserIdByEmployeeId.values().next().value;
+
     const fileIdByDocumentId = new Map();
-    const manifest = loadManifest(dto.caseId);
+    const manifest = SKIP_FILES ? [] : loadManifest(dto.caseId);
     for (const entry of manifest) {
+      const uploadedById =
+        resolvedUserIdByEmployeeId.get(entry.createdById) || fallbackUploaderId;
       try {
         process.stderr.write(`    Uploading file "${entry.title}"... `);
-        const file = await uploadCaseFile(dto.caseId, entry);
+        const file = await uploadCaseFile(dto.caseId, entry, uploadedById);
         if (entry.documentId && file?.id) {
           fileIdByDocumentId.set(entry.documentId, file.id);
         }
@@ -314,7 +400,7 @@ async function uploadCosts(caseId, costs) {
         `    ${skipped} cost(s) on case ${dto.caseId} not linked to an estimate item - skipped`,
       );
     }
-    if (unmatchedDocuments) {
+    if (unmatchedDocuments && !SKIP_FILES) {
       console.error(
         `    ${unmatchedDocuments} cost(s) on case ${dto.caseId} reference a document with no uploaded file - imported without file link`,
       );

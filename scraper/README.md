@@ -89,11 +89,14 @@ from their Case Manager documents:
    `documentId` via the map built in pass 2. Costs whose document has no
    uploaded file import without the link and are counted in the log.
 
-`uploadedById` is currently a hardcoded placeholder in `uploadCases.js` —
-replace it with a real mapped user ID before a production run. File and
-cost failures are logged and tallied separately from case failures; run
-`downloadDocuments.js` first so manifests exist (both it and `runAll.js`
-must be re-run after the `documentId` change so their outputs carry it).
+Each file uploads as the NotusPoint user created for the Case Manager
+employee who created the document (manifest `createdById`), falling back
+to the case's assigned user, then any imported staff member. Staff are
+imported only for employees referenced somewhere: cost loggers, assigned
+case users, and document creators. File and cost failures are logged and
+tallied separately from case failures; run `downloadDocuments.js` first so
+manifests exist (both it and `runAll.js` must be re-run whenever manifest
+or structured-data fields are added, e.g. `documentId`/`createdById`).
 
 ### `node downloadDocuments.js [caseListFile]`
 
