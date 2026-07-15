@@ -157,6 +157,9 @@ function buildCosts(endpoints) {
       rate: Math.round((cost.UnitChargeAmt ?? 0) * 100),
       total: Math.round((cost.TotalCharge ?? 0) * 100),
       billingInstanceItemId: nullId(cost.EstimateCostID) ? '' : cost.EstimateCostID,
+      // Case Manager document created alongside the cost (e.g. the file note);
+      // the uploader resolves it to the NotusPoint file the document import created
+      documentId: nullId(cost.DocumentID) ? '' : cost.DocumentID,
       employeeId: nullId(cost.EmployeeID) ? '' : cost.EmployeeID,
       date: formatDate(cost.ReferenceDate),
       createdAt: formatDate(cost.ReferenceDate),

@@ -117,22 +117,34 @@ async function downloadNonFileDoc(context, token, caseId, doc) {
       const caseDir = path.join(OUTPUT_DIR, caseId);
       fs.mkdirSync(caseDir, { recursive: true });
 
+      // One bad document must not abort the case: the manifest is written
+      // regardless, listing what succeeded, so the upload step always has it
       const manifest = [];
+      const failedDocs = [];
       for (const doc of documents) {
-        const { buffer, filename } = doc.IsFile
-          ? await downloadDocumentFile(context, doc.ID)
-          : await downloadNonFileDoc(context, token, caseId, doc);
-        const safeName = uniquePath(caseDir, sanitizeFilename(filename));
-        fs.writeFileSync(path.join(caseDir, safeName), buffer);
-        manifest.push({
-          filename: safeName,
-          title: doc.Title ?? safeName,
-          fileType: classifyFileType(doc),
-          dateUploaded: doc.DateCreated ?? '',
-        });
+        try {
+          const { buffer, filename } = doc.IsFile
+            ? await downloadDocumentFile(context, doc.ID)
+            : await downloadNonFileDoc(context, token, caseId, doc);
+          const safeName = uniquePath(caseDir, sanitizeFilename(filename));
+          fs.writeFileSync(path.join(caseDir, safeName), buffer);
+          manifest.push({
+            documentId: doc.ID,
+            filename: safeName,
+            title: doc.Title ?? safeName,
+            fileType: classifyFileType(doc),
+            dateUploaded: doc.DateCreated ?? '',
+          });
+        } catch (err) {
+          failedDocs.push({ id: doc.ID, title: doc.Title ?? '', error: err.message });
+          console.error(`  document "${doc.Title ?? doc.ID}" FAILED: ${err.message}`);
+        }
       }
       fs.writeFileSync(path.join(caseDir, 'manifest.json'), JSON.stringify(manifest, null, 2));
-      console.error(`${progress} Case ${caseId}: saved ${documents.length} document(s)`);
+      console.error(
+        `${progress} Case ${caseId}: saved ${manifest.length}/${documents.length} document(s)` +
+          (failedDocs.length ? `, ${failedDocs.length} FAILED` : ''),
+      );
     } catch (err) {
       console.error(`${progress} Case ${caseId} FAILED: ${err.message}`);
     }

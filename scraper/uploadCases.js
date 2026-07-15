@@ -11,7 +11,10 @@ const IMPORT_FILE_URL =
   process.env.IMPORT_FILE_URL || "http://localhost:8080/api/importer/case/file";
 const IMPORT_STAFF_URL =
   process.env.IMPORT_STAFF_URL || "http://localhost:8080/api/importer/staff";
-const UPLOADED_BY_ID = "5a04e3e0-78bd-4fd8-bd93-a64fe9acb784"; // TODO: Replace with actual user ID, mapped from old to new
+const IMPORT_COSTS_URL =
+  process.env.IMPORT_COSTS_URL ||
+  "http://localhost:8080/api/importer/case/costs";
+const UPLOADED_BY_ID = "b39312ed-4baf-4904-b21b-72df55345d62"; // TODO: Replace with actual user ID, mapped from old to new
 
 if (!fs.existsSync(STRUCTURED_FILE)) {
   console.error(`Structured data file not found: ${STRUCTURED_FILE}`);
@@ -42,11 +45,17 @@ function toStaffImportDto(employee) {
   return dto;
 }
 
-// Costs can only import against a billing template item in the same payload;
-// anything unlinked in the source (or linked to a deleted estimate row) is
-// skipped and reported. employeeId is the Case Manager ID, resolved to the
-// user the staff import created.
-function toCostImportDtos(caseRecord, resolvedUserIdByEmployeeId) {
+// Costs import in a second pass (after the case and its files) so each cost
+// can link to the NotusPoint file created from its Case Manager document.
+// Costs unlinked in the source (or linked to a deleted estimate row) are
+// skipped and reported; costs whose document didn't upload just lose the file
+// link. employeeId is the Case Manager ID, resolved to the user the staff
+// import created.
+function toCostImportDtos(
+  caseRecord,
+  resolvedUserIdByEmployeeId,
+  fileIdByDocumentId,
+) {
   const itemIds = new Set(
     (caseRecord.billingTemplates ?? []).flatMap((t) =>
       t.items.map((i) => i.id),
@@ -54,6 +63,7 @@ function toCostImportDtos(caseRecord, resolvedUserIdByEmployeeId) {
   );
   const costs = [];
   let skipped = 0;
+  let unmatchedDocuments = 0;
 
   for (const cost of caseRecord.costs ?? []) {
     if (!itemIds.has(cost.billingInstanceItemId)) {
@@ -71,10 +81,15 @@ function toCostImportDtos(caseRecord, resolvedUserIdByEmployeeId) {
     };
     const userId = resolvedUserIdByEmployeeId.get(cost.employeeId);
     if (userId) dto.userId = userId;
+    if (cost.documentId) {
+      const fileId = fileIdByDocumentId.get(cost.documentId);
+      if (fileId) dto.fileId = fileId;
+      else unmatchedDocuments++;
+    }
     costs.push(dto);
   }
 
-  return { costs, skipped };
+  return { costs, skipped, unmatchedDocuments };
 }
 
 function toCaseImportDto(caseRecord, resolvedEmailByEmployeeId) {
@@ -188,6 +203,24 @@ async function uploadCaseFile(caseId, entry) {
       `${res.status} ${res.statusText}${body ? ` - ${body}` : ""}`,
     );
   }
+
+  // The created case file; its id links costs to the file they came from
+  return res.json();
+}
+
+async function uploadCosts(caseId, costs) {
+  const res = await fetch(IMPORT_COSTS_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ caseId, costs }),
+  });
+
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new Error(
+      `${res.status} ${res.statusText}${body ? ` - ${body}` : ""}`,
+    );
+  }
 }
 
 (async () => {
@@ -229,24 +262,16 @@ async function uploadCaseFile(caseId, entry) {
 
   const failed = [];
   const failedFiles = [];
+  const failedCosts = [];
   let done = 0;
   let filesUploaded = 0;
 
+  // Order per case: case (with billing templates) -> files -> costs, so costs
+  // can reference the file ids the file import created.
   for (const caseRecord of cases) {
     done++;
     const progress = `[${done}/${cases.length}]`;
     const dto = toCaseImportDto(caseRecord, resolvedEmailByEmployeeId);
-
-    const { costs, skipped } = toCostImportDtos(
-      caseRecord,
-      resolvedUserIdByEmployeeId,
-    );
-    if (costs.length) dto.costs = costs;
-    if (skipped) {
-      console.error(
-        `    ${skipped} cost(s) on case ${dto.caseId} not linked to an estimate item - skipped`,
-      );
-    }
 
     try {
       process.stderr.write(`${progress} Uploading case ${dto.caseId}... `);
@@ -258,11 +283,15 @@ async function uploadCaseFile(caseId, entry) {
       continue;
     }
 
+    const fileIdByDocumentId = new Map();
     const manifest = loadManifest(dto.caseId);
     for (const entry of manifest) {
       try {
         process.stderr.write(`    Uploading file "${entry.title}"... `);
-        await uploadCaseFile(dto.caseId, entry);
+        const file = await uploadCaseFile(dto.caseId, entry);
+        if (entry.documentId && file?.id) {
+          fileIdByDocumentId.set(entry.documentId, file.id);
+        }
         filesUploaded++;
         console.error("done");
       } catch (err) {
@@ -272,6 +301,34 @@ async function uploadCaseFile(caseId, entry) {
           filename: entry.filename,
           error: err.message,
         });
+      }
+    }
+
+    const { costs, skipped, unmatchedDocuments } = toCostImportDtos(
+      caseRecord,
+      resolvedUserIdByEmployeeId,
+      fileIdByDocumentId,
+    );
+    if (skipped) {
+      console.error(
+        `    ${skipped} cost(s) on case ${dto.caseId} not linked to an estimate item - skipped`,
+      );
+    }
+    if (unmatchedDocuments) {
+      console.error(
+        `    ${unmatchedDocuments} cost(s) on case ${dto.caseId} reference a document with no uploaded file - imported without file link`,
+      );
+    }
+    if (costs.length) {
+      try {
+        process.stderr.write(
+          `    Uploading ${costs.length} cost(s) for case ${dto.caseId}... `,
+        );
+        await uploadCosts(dto.caseId, costs);
+        console.error("done");
+      } catch (err) {
+        console.error(`FAILED: ${err.message}`);
+        failedCosts.push({ caseId: dto.caseId, error: err.message });
       }
     }
   }
@@ -291,6 +348,11 @@ async function uploadCaseFile(caseId, entry) {
     console.error(`${failedFiles.length} file(s) failed:`);
     for (const f of failedFiles)
       console.error(`  - ${f.caseId}/${f.filename}: ${f.error}`);
+    process.exitCode = 1;
+  }
+  if (failedCosts.length) {
+    console.error(`${failedCosts.length} case(s) had cost upload failures:`);
+    for (const f of failedCosts) console.error(`  - ${f.caseId}: ${f.error}`);
     process.exitCode = 1;
   }
   if (failedStaff.length) {

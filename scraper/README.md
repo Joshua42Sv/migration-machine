@@ -76,14 +76,24 @@ default, override with `IMPORT_URL`). Failures for individual cases are
 logged and don't stop the run; a summary of failed case IDs is printed at
 the end.
 
-Immediately after a case uploads successfully, its documents are uploaded
-too: reads `documents/{caseId}/manifest.json` and POSTs each file as
-`multipart/form-data` to `http://localhost:8080/api/importer/case/file`
-(override with `IMPORT_FILE_URL`), one at a time. `uploadedById` is
-currently a hardcoded placeholder in `uploadCases.js` — replace it with a
-real mapped user ID before a production run. File failures are logged and
-tallied separately from case failures; run `downloadDocuments.js` first so
-manifests exist.
+Each case uploads in three passes so costs can link to the files created
+from their Case Manager documents:
+
+1. Case + billing templates (no costs) to `/api/importer/case`.
+2. Documents: reads `documents/{caseId}/manifest.json` and POSTs each file
+   as `multipart/form-data` to `http://localhost:8080/api/importer/case/file`
+   (override with `IMPORT_FILE_URL`). Each response's file ID is recorded
+   against the manifest entry's Case Manager `documentId`.
+3. Costs to `http://localhost:8080/api/importer/case/costs` (override with
+   `IMPORT_COSTS_URL`), with each cost's `fileId` resolved from its
+   `documentId` via the map built in pass 2. Costs whose document has no
+   uploaded file import without the link and are counted in the log.
+
+`uploadedById` is currently a hardcoded placeholder in `uploadCases.js` —
+replace it with a real mapped user ID before a production run. File and
+cost failures are logged and tallied separately from case failures; run
+`downloadDocuments.js` first so manifests exist (both it and `runAll.js`
+must be re-run after the `documentId` change so their outputs carry it).
 
 ### `node downloadDocuments.js [caseListFile]`
 
