@@ -155,13 +155,12 @@ Incremental per document: a retried case keeps every file its previous run
 downloaded (matched by `documentId` via the manifest) and fetches only the
 missing ones, so one failed document costs one re-download, not the whole
 case. Documents across all in-flight cases download in parallel through the
-global `CM_MAX_INFLIGHT` pool. Real files never fetch the per-document
-`GetData` call — it was only needed for `CreatedByID`, and doubling every
-file's requests for attribution alone dominated download time. When the
-list rows carry `CreatedByID` it's used; otherwise files upload attributed
-to the case's assigned user (`CM_FORCE_GETDATA=1` restores exact
-attribution). Emails/notes always fetch `GetData` — their bodies live
-there.
+global `CM_MAX_INFLIGHT` pool. Creator attribution (`CreatedByID`) is
+mandatory — files must be attributed exactly as in Case Manager — so for
+real files the per-document `GetData` call is skipped only when the list
+rows already carry `CreatedByID` (probed on the first case; no fidelity
+loss, nearly half the requests). When they don't, `GetData` is fetched per
+document. Emails/notes always fetch `GetData` — their bodies live there.
 
 ### `node uploadCases.js [--skip-files] [--costs-without-files]`
 
