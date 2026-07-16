@@ -24,13 +24,36 @@ const SINGLE_DIR = path.join(DIR, 'single');
 const LEGACY_FILES = ['cases.json', 'structuredData.json'].map((f) => path.join(DIR, f));
 const IMPORT_URL = process.env.IMPORT_URL || 'http://localhost:8080/api/importer/case';
 
+// Wall-clock stamp appended to every log line (runs span days, so keep the date)
+function ts() {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, '0');
+  return pc.dim(`[${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}]`);
+}
+
+// Re-emits a child stream line by line with the timestamp appended, so the
+// stage scripts' own progress output stays untouched at the source.
+function stampLines(src, dest) {
+  let buf = '';
+  src.setEncoding('utf8');
+  src.on('data', (chunk) => {
+    buf += chunk;
+    const lines = buf.split('\n');
+    buf = lines.pop();
+    for (const line of lines) dest.write(line.trim() ? `${line} ${ts()}\n` : `${line}\n`);
+  });
+  src.on('end', () => { if (buf) dest.write(`${buf} ${ts()}\n`); });
+}
+
 function run(script, args = [], env = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [path.join(DIR, script), ...args], {
       cwd: DIR,
-      stdio: 'inherit',
+      stdio: ['inherit', 'pipe', 'pipe'],
       env: { ...process.env, ...env },
     });
+    stampLines(child.stdout, process.stdout);
+    stampLines(child.stderr, process.stderr);
     child.on('error', reject);
     child.on('close', (code) => {
       if (code === 0) resolve();
@@ -51,14 +74,14 @@ function fmtDuration(ms) {
 // every stage resumes, so re-running retries just the incomplete cases.
 async function step(title, script, args = [], env = {}) {
   console.log('');
-  log.step(pc.bold(title));
+  log.step(`${pc.bold(title)} ${ts()}`);
   const started = Date.now();
   try {
     await run(script, args, env);
-    log.success(pc.green(`${title} — done in ${fmtDuration(Date.now() - started)}`));
+    log.success(`${pc.green(`${title} — done in ${fmtDuration(Date.now() - started)}`)} ${ts()}`);
     return true;
   } catch (err) {
-    log.error(pc.red(`${title} — ${err.message} (after ${fmtDuration(Date.now() - started)})`));
+    log.error(`${pc.red(`${title} — ${err.message} (after ${fmtDuration(Date.now() - started)})`)} ${ts()}`);
     return false;
   }
 }

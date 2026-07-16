@@ -143,7 +143,9 @@ function classifyFileType(doc) {
   if (WORD_EXTENSIONS.has(ext)) return 'WORD';
   if (EXCEL_EXTENSIONS.has(ext)) return 'EXCEL';
   if (IMAGE_EXTENSIONS.has(ext)) return 'IMAGE';
-  return 'CASE_NOTE';
+  // Archives and anything else binary must not be CASE_NOTE — the importer
+  // decodes CASE_NOTE buffers as UTF-8 into noteText, which null bytes break
+  return 'OTHER';
 }
 
 (async () => {
