@@ -2,3 +2,4 @@ node_modules/
 scraper/cases.json
 scraper/structuredData.json
 scraper/documents
+scraper/.DS_Store
