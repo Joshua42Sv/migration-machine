@@ -155,8 +155,8 @@ function classifyFileType(doc) {
 (async () => {
   const ledger = loadLedger(paths.root);
   const caseIds = readCaseList();
-  // Resume: only cases not yet fully downloaded run; each case's directory is
-  // rebuilt from scratch so its manifest is always consistent.
+  // Resume: only cases not yet fully downloaded run, and within a case only
+  // documents missing from its manifest are fetched (see processCase).
   const pending = caseIds.filter(id => ledger.stageStatus(id, 'documents') !== 'done');
 
   console.error(`Total: ${caseIds.length} case(s) in list, ${caseIds.length - pending.length} already downloaded, ${pending.length} to fetch`);
@@ -232,9 +232,12 @@ function classifyFileType(doc) {
     }
   }
 
-  // Downloads and re-writes one case's directory in full, returning the
-  // ledger patch. All its documents go through the client's global limiter
-  // together, so cases and documents interleave freely.
+  // Downloads one case's documents, returning the ledger patch. All its
+  // documents go through the client's global limiter together, so cases and
+  // documents interleave freely. Resume is per-document: files an earlier run
+  // already downloaded (matched by documentId via the previous manifest) are
+  // kept, so retrying a 900-document case with one failure fetches one
+  // document, not 900.
   async function processCase(caseId) {
     const documents = await client.getCaseDocuments(caseId);
 
@@ -248,18 +251,42 @@ function classifyFileType(doc) {
     }
 
     if (documents.length === 0) {
-      return { status: 'done', expected: 0, downloaded: 0, failed: 0, error: undefined };
+      return { status: 'done', expected: 0, downloaded: 0, reused: 0, failed: 0, error: undefined };
     }
 
     const caseDir = path.join(OUTPUT_DIR, caseId);
-    fs.rmSync(caseDir, { recursive: true, force: true });
     fs.mkdirSync(caseDir, { recursive: true });
 
-    const taken = new Set(['manifest.json', '.uploadstate.json']);
+    const previous = new Map();
+    try {
+      for (const entry of JSON.parse(fs.readFileSync(path.join(caseDir, 'manifest.json'), 'utf8'))) {
+        previous.set(entry.documentId, entry);
+      }
+    } catch {} // no/unreadable manifest — download everything
+
+    const reusedEntries = [];
+    const toFetch = [];
+    for (const doc of documents) {
+      const prev = previous.get(doc.ID);
+      if (prev && fs.existsSync(path.join(caseDir, prev.filename))) reusedEntries.push(prev);
+      else toFetch.push(doc);
+    }
+
+    // Remove files no reused entry claims (crashed-run leftovers, documents
+    // deleted in CM) so filenames stay collision-free and the directory always
+    // matches the manifest. The upload sidecar survives — it's keyed by
+    // documentId and the uploader skips ids it doesn't find in the manifest.
+    const keep = new Set(['manifest.json', '.uploadstate.json',
+      ...reusedEntries.map((e) => e.filename.toLowerCase())]);
+    for (const f of fs.readdirSync(caseDir)) {
+      if (!keep.has(f.toLowerCase())) fs.rmSync(path.join(caseDir, f), { force: true });
+    }
+
+    const taken = new Set(keep);
     const results = await Promise.all(
-      documents.map((doc) => downloadOne(caseId, caseDir, taken, doc)),
+      toFetch.map((doc) => downloadOne(caseId, caseDir, taken, doc)),
     );
-    const manifest = results.filter((r) => r.entry).map((r) => r.entry);
+    const manifest = [...reusedEntries, ...results.filter((r) => r.entry).map((r) => r.entry)];
     const failedDocs = results.filter((r) => r.failure).map((r) => r.failure);
 
     fs.writeFileSync(path.join(caseDir, 'manifest.json'), JSON.stringify(manifest, null, 2));
@@ -267,6 +294,7 @@ function classifyFileType(doc) {
       status: failedDocs.length ? 'failed' : 'done',
       expected: documents.length,
       downloaded: manifest.length,
+      reused: reusedEntries.length,
       failed: failedDocs.length,
       error: failedDocs.length ? failedDocs[0].error : undefined,
     };
@@ -291,7 +319,9 @@ function classifyFileType(doc) {
     console.error(
       `[${completed}/${pending.length}] Case ${caseId}: ` +
       (result.expected != null
-        ? `${result.downloaded}/${result.expected} document(s)${result.failed ? ` (${result.failed} FAILED)` : ''}`
+        ? `${result.downloaded}/${result.expected} document(s)` +
+          `${result.reused ? ` (${result.reused} kept from last run)` : ''}` +
+          `${result.failed ? ` (${result.failed} FAILED)` : ''}`
         : `FAILED: ${result.error}`),
     );
   });

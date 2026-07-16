@@ -14,6 +14,9 @@ const { createLimiter } = require('./pool');
 
 const BASE_URL = 'https://workcom.casemanager.biz';
 const MAX_ATTEMPTS = 5;
+// CM queues requests server-side under load, so slow outliers are normal at
+// full saturation; Playwright's default 30s failed real GetData calls.
+const REQUEST_TIMEOUT_MS = 120000;
 const JSON_CT = 'application/json; charset=UTF-8';
 const FORM_CT = 'application/x-www-form-urlencoded; charset=UTF-8';
 
@@ -57,11 +60,11 @@ function jsonOrThrow(status, ok, text, label) {
 async function createClient({
   username,
   password,
-  // Default pushed high on purpose — CM latency (~1.5s/request) means
-  // throughput scales with in-flight count, and the backoff on 429/5xx
-  // self-throttles if the WAF pushes back. Lower via CM_MAX_INFLIGHT in .env
-  // if 403s appear (backoff doesn't help those — they fail the document).
-  maxInFlight = Number(process.env.CM_MAX_INFLIGHT ?? 64),
+  // Measured 2026-07-16: CM tops out around ~10 requests/sec server-side
+  // regardless of concurrency — a 64 in-flight trial moved throughput not at
+  // all, just pushed per-request latency into request timeouts. 24 keeps the
+  // server saturated with headroom; raising this further buys nothing.
+  maxInFlight = Number(process.env.CM_MAX_INFLIGHT ?? 24),
 } = {}) {
   const browser = await chromium.launch({ headless: true });
   const context = await browser.newContext();
@@ -105,6 +108,7 @@ async function createClient({
     const res = await context.request.post(`${BASE_URL}${path}`, {
       headers: buildHeaders(t, JSON_CT),
       data,
+      timeout: REQUEST_TIMEOUT_MS,
     });
     return jsonOrThrow(res.status(), res.ok(), await res.text(), label);
   });
@@ -113,6 +117,7 @@ async function createClient({
     const res = await context.request.post(`${BASE_URL}${path}`, {
       headers: buildHeaders(t, FORM_CT),
       form,
+      timeout: REQUEST_TIMEOUT_MS,
     });
     return jsonOrThrow(res.status(), res.ok(), await res.text(), label);
   });
@@ -165,6 +170,7 @@ async function createClient({
       const res = await context.request.post(`${BASE_URL}/CaseEstimate/_List`, {
         headers: buildHeaders(t, FORM_CT),
         form: { caseNumber: caseId },
+        timeout: REQUEST_TIMEOUT_MS,
       });
       const text = await res.text();
       // Responds 500 with a plain-text message when a case has no estimates
@@ -181,6 +187,7 @@ async function createClient({
       const res = await context.request.post(`${BASE_URL}/CaseCost/_List`, {
         headers: buildHeaders(t, FORM_CT),
         form: { caseNumber: caseId },
+        timeout: REQUEST_TIMEOUT_MS,
       });
       const text = await res.text();
       // Mirrors /CaseEstimate/_List, which 500s with a plain-text message when there is no data
@@ -203,7 +210,9 @@ async function createClient({
     }),
 
     downloadDocumentFile: (documentId) => request('/CaseDocument/GetFile', async () => {
-      const res = await context.request.get(`${BASE_URL}/CaseDocument/GetFile/${documentId}`);
+      const res = await context.request.get(`${BASE_URL}/CaseDocument/GetFile/${documentId}`, {
+        timeout: REQUEST_TIMEOUT_MS,
+      });
       return binaryOrThrow(res, '/CaseDocument/GetFile', documentId);
     }),
 
@@ -212,6 +221,7 @@ async function createClient({
     downloadDocumentAttachment: (documentId, attachmentId) => request('/CaseDocument/GetAttachment', async () => {
       const res = await context.request.get(`${BASE_URL}/CaseDocument/GetAttachment/`, {
         params: { documentID: documentId, attachmentID: attachmentId },
+        timeout: REQUEST_TIMEOUT_MS,
       });
       return binaryOrThrow(res, '/CaseDocument/GetAttachment', attachmentId);
     }),

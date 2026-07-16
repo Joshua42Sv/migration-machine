@@ -108,20 +108,18 @@ requests wait on. Knobs (env vars):
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `CM_MAX_INFLIGHT` | 16 | Max concurrent requests to Case Manager (the real throttle — lower it if the WAF objects) |
-| `CM_CASE_CONCURRENCY` | 6 export / 3 docs | Cases processed at once per stage |
-| `CM_FORCE_GETDATA` | unset | Set to `1` to always fetch per-document GetData even when the list rows carry `CreatedByID` |
-| `UPLOAD_CASE_CONCURRENCY` | 3 | Cases uploaded at once |
-| `UPLOAD_FILE_CONCURRENCY` | 8 | Concurrent file POSTs to the importer (global, across all cases) |
+| `CM_MAX_INFLIGHT` | 24 | Max concurrent requests to Case Manager. CM tops out around ~10 req/s server-side (measured 2026-07-16: 64 in-flight moved throughput not at all, just inflated latency into timeouts) — raising this buys nothing |
+| `CM_CASE_CONCURRENCY` | 12 export / 8 docs | Cases processed at once per stage (just keeps the in-flight pool fed across case boundaries) |
+| `CM_FORCE_GETDATA` | unset | Set to `1` to fetch per-file GetData for exact creator attribution (~2x the CM requests; see `downloadDocuments.js` below) |
+| `UPLOAD_CASE_CONCURRENCY` | 8 | Cases uploaded at once |
+| `UPLOAD_FILE_CONCURRENCY` | 32 | Concurrent file POSTs to the importer (global, across all cases) |
 
-**Download and upload can run at the same time** (two terminals): the
-uploader only touches cases whose `documents` stage is `done` in the ledger,
-so run `downloadDocuments.js` in one terminal and re-run `uploadCases.js`
-periodically in another to drain finished cases during the download window.
-
-Before the full 3,000-case run, push a ~20-case batch through and watch for
-CM 403s (WAF) — if they appear, lower `CM_MAX_INFLIGHT`. The ledger means an
-aborted experiment costs nothing but time.
+**Download and upload run at the same time** in the CLI pipeline: answer
+"yes" to the concurrent-upload prompt and upload passes drain each case as
+its documents complete, so the upload adds no wall-clock time. (Manually:
+`downloadDocuments.js` in one terminal, re-run `uploadCases.js` in another —
+ledger writes are lock-protected and merge, so concurrent processes are
+safe.)
 
 ## Underlying scripts
 
@@ -153,13 +151,17 @@ Downloads every document attached to each not-yet-done case into
   original Case Manager title and a `fileType` (`EMAIL`, `CASE_NOTE`,
   `PDF`, `WORD`, `EXCEL`, `IMAGE`) used by `uploadCases.js`.
 
-Incremental: only cases not marked done are (re)downloaded, each case's
-directory rebuilt in full so its manifest is always consistent. Documents
-across all in-flight cases download in parallel through the global
-`CM_MAX_INFLIGHT` pool. For real files, the per-document `GetData` call
-(needed only for `CreatedByID`) is skipped when the document list rows
-already carry it — probed automatically on the first case — nearly halving
-Case Manager requests on document-heavy cases.
+Incremental per document: a retried case keeps every file its previous run
+downloaded (matched by `documentId` via the manifest) and fetches only the
+missing ones, so one failed document costs one re-download, not the whole
+case. Documents across all in-flight cases download in parallel through the
+global `CM_MAX_INFLIGHT` pool. Real files never fetch the per-document
+`GetData` call — it was only needed for `CreatedByID`, and doubling every
+file's requests for attribution alone dominated download time. When the
+list rows carry `CreatedByID` it's used; otherwise files upload attributed
+to the case's assigned user (`CM_FORCE_GETDATA=1` restores exact
+attribution). Emails/notes always fetch `GetData` — their bodies live
+there.
 
 ### `node uploadCases.js [--skip-files] [--costs-without-files]`
 
@@ -213,8 +215,10 @@ Re-running any step resumes/retries; wipe via the CLI to start over.
 
 ## Known limitations / things to check before the production (~3,000 case) run
 
-- The WAF's tolerance for `CM_MAX_INFLIGHT=16` is untested — trial a ~20-case
-  batch and watch for 403s before the full run.
+- CM's ~10 req/s server-side ceiling caps the download at roughly
+  ~1.5–2 days for ~1.6M documents — inside the 48h window but without much
+  slack. If that's too tight, the next lever is multiple CM sessions in
+  parallel (untested; WAF/account risk).
 - Document handling has only been verified against `.pdf`, `.docx`, `.eml`,
   and `.cmrtf` from a handful of cases — other document/record types may
   appear at scale and aren't explicitly handled yet.
