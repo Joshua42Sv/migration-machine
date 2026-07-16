@@ -1,14 +1,20 @@
 require('dotenv').config();
-const { chromium } = require('playwright');
 const fs = require('fs');
 const path = require('path');
-const { login, captureCase, getAllLookups, getEmployeeList } = require('./lib/apiClient');
+const { createClient, isBrowserGone } = require('./lib/cmClient');
+const { mapPool } = require('./lib/pool');
+const { roots } = require('./lib/paths');
+const { loadLedger } = require('./lib/ledger');
+const { buildLookupMap, buildEmployeeMap, buildStructuredCase, countsFor } = require('./lib/structured');
 
 const USERNAME = process.env.CM_USER || '';
 const PASSWORD = process.env.CM_PASS || '';
-const LIST_FILE = process.argv[2] || path.join(__dirname, 'caseList.txt');
-const OUTPUT_FILE = path.join(__dirname, 'cases.json');
-const STRUCTURED_FILE = path.join(__dirname, 'structuredData.json');
+const paths = roots();
+const LIST_FILE = process.argv[2] || paths.caseList;
+// How many cases capture concurrently. Total CM load is governed by the
+// client's global CM_MAX_INFLIGHT cap either way; this just keeps enough
+// case work queued to fill it.
+const CASE_CONCURRENCY = Number(process.env.CM_CASE_CONCURRENCY ?? 6);
 
 if (!USERNAME || !PASSWORD) {
   console.error('Set CM_USER and CM_PASS environment variables');
@@ -21,325 +27,6 @@ if (!fs.existsSync(LIST_FILE)) {
   process.exit(1);
 }
 
-function saveCases(data, lookups, employeeList) {
-  fs.writeFileSync(OUTPUT_FILE, JSON.stringify(data, null, 2));
-  saveStructuredData(data, lookups, employeeList);
-}
-
-function buildLookupMap(lookups) {
-  const map = {};
-  for (const list of Object.values(lookups)) {
-    if (!Array.isArray(list)) continue;
-    for (const item of list) {
-      if (item.ID && item.Description) map[item.ID] = item.Description;
-    }
-  }
-  return map;
-}
-
-function buildEmployeeMap(employeeList) {
-  const map = {};
-  for (const employee of employeeList) {
-    if (!employee.ID) continue;
-    map[employee.ID] = {
-      firstName: employee.FirstName ?? '',
-      lastName: employee.LastName ?? '',
-      email: employee.UserID ?? '',
-      phone: employee.Phone1 ?? '',
-      qualifications: employee.ServicesDescription ?? '',
-    };
-  }
-  return map;
-}
-
-function nullId(id) {
-  return !id || id === '00000000-0000-0000-0000-000000000000';
-}
-
-function resolveId(map, id) {
-  if (nullId(id)) return '';
-  return map[id] ?? '';
-}
-
-function formatDate(iso) {
-  if (!iso) return '';
-  return iso.split('T')[0];
-}
-
-function buildAddress(map, { street, suburb, postalCode, regionId, countryId }) {
-  return {
-    addressLine1: street ?? '',
-    addressLine2: '',
-    suburb: suburb ?? '',
-    state: resolveId(map, regionId),
-    postcode: postalCode ?? '',
-    country: resolveId(map, countryId),
-  };
-}
-
-// Each estimate in the source system becomes one billing template, its cost
-// rows the template's items. A /CaseEstimate/GetData response is a flat tree:
-// the row carrying an Estimate payload is the estimate itself (ItemType is
-// not reliable - grouping rows reuse 0), rows with a Cost payload are the
-// billable line items, possibly nested under grouping rows. NotusPoint money
-// is GST-INCLUSIVE cents (invoicing extracts GST from totals), so rates come
-// from UnitChargeAmt as-is; hourly quantities (CostType 0) are decimal hours
-// in Case Manager and seconds in the NotusPoint importer.
-function buildBillingTemplates(caseId, endpoints) {
-  const estimateList = endpoints?.['/CaseEstimate/_List']?.[0] ?? [];
-  const itemsByEstimateId = {};
-
-  for (const response of endpoints?.['/CaseEstimate/GetData'] ?? []) {
-    const rows = Array.isArray(response?.Items) ? response.Items : [];
-    const rowById = new Map(rows.map(row => [row.ID, row]));
-    const ownerEstimateId = (row) => {
-      let node = row;
-      while (node && !node.Estimate) node = rowById.get(node.ParentID);
-      return node?.ID ?? '';
-    };
-
-    for (const row of rows) {
-      if (!row.Cost) continue;
-      const estimateId = ownerEstimateId(row);
-      (itemsByEstimateId[estimateId] ??= []).push(row.Cost);
-    }
-  }
-
-  return estimateList.map(estimate => {
-    const createdAt = formatDate(estimate.DateCreated);
-    const expiryDate = formatDate(estimate.FinishDate);
-
-    const items = (itemsByEstimateId[estimate.ID] ?? []).map(cost => {
-      const hourly = cost.CostType === 0;
-      const item = {
-        id: cost.ID,
-        name: cost.Description || 'Unknown',
-        chargeCode: cost.ChargeCode ?? '',
-        billingType: hourly ? 'HOURLY' : 'FIXED_AMOUNT',
-        taxType: cost.UnitChargeTaxCode === 'GST' || cost.UnitChargeTaxRate > 0 ? 'GST' : 'GST_FREE',
-        rate: Math.round((cost.UnitChargeAmt ?? 0) * 100),
-        quantity: hourly ? Math.round((cost.Quantity ?? 0) * 3600) : Math.round(cost.Quantity ?? 0),
-        // CM's stored line total; saved verbatim so NotusPoint matches to
-        // the cent instead of re-deriving from the rounded rate/quantity
-        total: Math.round((cost.TotalCharge ?? 0) * 100),
-        billingTemplateInstanceId: estimate.ID,
-        createdAt: formatDate(cost.StartDate) || createdAt,
-      };
-      const itemExpiry = formatDate(cost.FinishDate) || expiryDate;
-      if (itemExpiry) item.expiryDate = itemExpiry;
-      return item;
-    });
-
-    const template = {
-      id: estimate.ID,
-      name: estimate.Description ?? '',
-      items,
-      caseId,
-      createdAt,
-      archived: estimate.IsCurrent !== true,
-    };
-    if (expiryDate) template.expiryDate = expiryDate;
-    return template;
-  });
-}
-
-// Logged costs from /CaseCost/GetData. EstimateCostID links a cost to the
-// estimate cost row it was logged against (= billing template item id);
-// costs without one are kept but need special handling at upload time.
-// UnitChargeAmt/TotalCharge include GST, which matches NotusPoint's
-// convention (invoicing extracts GST from the total), so dollars -> cents
-// as-is. Hourly quantities are converted from Case Manager decimal hours to
-// NotusPoint seconds. employeeId is the Case Manager ID; the uploader resolves
-// it to a NotusPoint user created by the staff import.
-function buildCosts(endpoints) {
-  return (endpoints?.['/CaseCost/GetData'] ?? []).map(cost => {
-    const hourly = cost.CostType === 0;
-    return {
-      status: cost.IsInvoiced ? 'INVOICED' : 'LOGGED',
-      quantity: hourly ? Math.round((cost.Quantity ?? 0) * 3600) : Math.round(cost.Quantity ?? 0),
-      rate: Math.round((cost.UnitChargeAmt ?? 0) * 100),
-      total: Math.round((cost.TotalCharge ?? 0) * 100),
-      billingInstanceItemId: nullId(cost.EstimateCostID) ? '' : cost.EstimateCostID,
-      // Case Manager document created alongside the cost (e.g. the file note);
-      // the uploader resolves it to the NotusPoint file the document import created
-      documentId: nullId(cost.DocumentID) ? '' : cost.DocumentID,
-      employeeId: nullId(cost.EmployeeID) ? '' : cost.EmployeeID,
-      date: formatDate(cost.ReferenceDate),
-      createdAt: formatDate(cost.ReferenceDate),
-    };
-  });
-}
-
-function saveStructuredData(data, lookups, employeeList) {
-  const lookup = buildLookupMap(lookups);
-  const employeeMap = buildEmployeeMap(employeeList);
-  const cases = [];
-  const causesMap = {};
-  const conditionsMap = {};
-  const employmentStatusesMap = {};
-  const statusesMap = {};
-  const categoriesMap = {};
-  const requirementsMap = {};
-
-  for (const [caseId, caseData] of Object.entries(data)) {
-    if (caseData.error) continue;
-
-    const contacts = caseData.endpoints?.['/CaseContact/_List'];
-    if (!contacts) continue;
-    const contactList = Array.isArray(contacts[0]?.data) ? contacts[0].data : [];
-    const client = contactList.find(c => c.PrimaryRoleName === 'Client');
-    if (!client) continue;
-
-    const caseInfo = caseData.endpoints?.['/Case/GetData']?.[0] ?? {};
-    const titlePart = client.ContactName?.split(', ')[2] ?? '';
-    const contactDetails = caseData.endpoints?.['/CaseContact/GetData'] ?? [];
-    const contactInfoById = new Map(
-      contactDetails.map(detail => [detail.ID, detail.ContactInfo ?? {}]),
-    );
-    const contactInfo = contactInfoById.get(client.ID) ?? {};
-    const referrerInfo = caseData.endpoints?.referrerContact?.[0]?.ContactInfo ?? {};
-
-    const causeId = nullId(caseInfo.CauseID) ? '' : caseInfo.CauseID;
-    const causeDescription = resolveId(lookup, caseInfo.CauseID);
-    const conditionId = nullId(caseInfo.ConditionID) ? '' : caseInfo.ConditionID;
-    const conditionDescription = resolveId(lookup, caseInfo.ConditionID);
-    const employmentStatusId = nullId(caseInfo.EmploymentStatusID) ? '' : caseInfo.EmploymentStatusID;
-    const employmentStatusDescription = resolveId(lookup, caseInfo.EmploymentStatusID);
-    const statusId = nullId(caseInfo.StatusID) ? '' : caseInfo.StatusID;
-    const statusDescription = resolveId(lookup, caseInfo.StatusID);
-    const categoryId = nullId(caseInfo.CategoryID) ? '' : caseInfo.CategoryID;
-    const categoryDescription = resolveId(lookup, caseInfo.CategoryID);
-    const requirementId = nullId(caseInfo.RequirementID) ? '' : caseInfo.RequirementID;
-    const requirementDescription = resolveId(lookup, caseInfo.RequirementID);
-
-    if (causeId) causesMap[causeId] = causeDescription;
-    if (conditionId) conditionsMap[conditionId] = conditionDescription;
-    if (employmentStatusId) employmentStatusesMap[employmentStatusId] = employmentStatusDescription;
-    if (statusId) statusesMap[statusId] = statusDescription;
-    if (categoryId) categoriesMap[categoryId] = categoryDescription;
-    if (requirementId) requirementsMap[requirementId] = requirementDescription;
-
-    const assignedUserId = nullId(caseInfo.AssignedToID) ? '' : caseInfo.AssignedToID;
-    const assignedUser = employeeMap[assignedUserId];
-    const assignedUserName = assignedUser ? `${assignedUser.firstName} ${assignedUser.lastName}`.trim() : '';
-    const assignedUserEmail = assignedUser?.email ?? '';
-
-    const clientAddress = buildAddress(lookup, {
-      street: contactInfo.Street,
-      suburb: contactInfo.Suburb,
-      postalCode: contactInfo.PostalCode,
-      regionId: contactInfo.RegionID,
-      countryId: contactInfo.CountryID,
-    });
-
-    const clientBillingAddress = contactInfo.Address2UsePrimary === false
-      ? buildAddress(lookup, {
-        street: contactInfo.Street2,
-        suburb: contactInfo.Suburb2,
-        postalCode: contactInfo.PostalCode2,
-        regionId: contactInfo.RegionID2,
-        countryId: contactInfo.CountryID2,
-      })
-      : null;
-
-    const referrer = {
-      firstName: referrerInfo.FirstName ?? '',
-      lastName: referrerInfo.LastName ?? '',
-      email: referrerInfo.Email1 ?? '',
-      phone: referrerInfo.Phone1 ?? '',
-      fax: referrerInfo.Fax ?? '',
-      position: resolveId(lookup, referrerInfo.PositionID),
-    };
-
-    // Client and Referrer already migrate as first-class records; QA and
-    // Workcom Admin are internal contacts that aren't wanted in NotusPoint
-    const EXCLUDED_CONTACT_ROLES = new Set(['Client', 'Referrer', 'QA', 'Workcom Admin']);
-    const caseContacts = [];
-    for (const row of contactList) {
-      const roles = (row.RoleNames ?? '').split(',').map(r => r.trim()).filter(Boolean);
-      if (roles.some(role => EXCLUDED_CONTACT_ROLES.has(role))) continue;
-
-      const detail = contactInfoById.get(row.ID) ?? {};
-      caseContacts.push({
-        firstName: detail.FirstName || row.FirstName || '',
-        lastName: detail.LastName || row.LastName || '',
-        email: detail.Email1 || row.Email || '',
-        company: detail.CompanyName || row.CompanyName || '',
-        phone: detail.Mobile || detail.Phone1 || detail.Phone2 || row.Phone || '',
-        fax: detail.Fax || '',
-        role: row.PrimaryRoleName || roles[0] || '',
-        address: buildAddress(lookup, {
-          street: detail.Street,
-          suburb: detail.Suburb,
-          postalCode: detail.PostalCode,
-          regionId: detail.RegionID,
-          countryId: detail.CountryID,
-        }),
-      });
-    }
-
-    const billingTemplates = buildBillingTemplates(caseId, caseData.endpoints);
-    const costs = buildCosts(caseData.endpoints);
-
-    // Client detail lives on ContactInfo (from /CaseContact/GetData), not the
-    // _List row - the row's Phone is often blank while ContactInfo.Mobile is set
-    const genderToSex = { M: 'male', F: 'female' };
-
-    cases.push({
-      caseId,
-      clientTitle: titlePart,
-      clientFirstName: client.FirstName ?? '',
-      clientLastName: client.LastName ?? '',
-      clientEmail: contactInfo.Email1 || client.Email || '',
-      clientPhone: contactInfo.Mobile || contactInfo.Phone1 || contactInfo.Phone2 || client.Phone || '',
-      clientLandline: contactInfo.Phone1 || contactInfo.Phone2 || '',
-      clientSecondaryEmail: contactInfo.Email2 || '',
-      clientDateOfBirth: formatDate(contactInfo.DateOfBirth),
-      clientSex: genderToSex[contactInfo.Gender] ?? (contactInfo.Gender ? 'other' : ''),
-      claimNumber: caseInfo.ClaimNo ?? '',
-      billerCode: caseInfo.BillerCode ?? '',
-      conditionDate: formatDate(caseInfo.ConditionDate),
-      referralDate: formatDate(caseInfo.DateOfReferral),
-      dateClosed: formatDate(caseInfo.DateClosed),
-      statusId,
-      statusDescription,
-      categoryId,
-      categoryDescription,
-      requirementId,
-      requirementDescription,
-      assignedUserId,
-      assignedUserName,
-      assignedUserEmail,
-      clientAddress,
-      clientBillingAddress,
-      referrer,
-      caseContacts,
-      employmentStatusId,
-      employmentStatusDescription,
-      causeId,
-      causeDescription,
-      conditionId,
-      conditionDescription,
-      billingTemplates,
-      costs,
-    });
-  }
-
-  const causes = Object.entries(causesMap).map(([id, description]) => ({ id, description }));
-  const conditions = Object.entries(conditionsMap).map(([id, description]) => ({ id, description }));
-  const employmentStatuses = Object.entries(employmentStatusesMap).map(([id, description]) => ({ id, description }));
-  const statuses = Object.entries(statusesMap).map(([id, description]) => ({ id, description }));
-  const categories = Object.entries(categoriesMap).map(([id, description]) => ({ id, description }));
-  const requirements = Object.entries(requirementsMap).map(([id, description]) => ({ id, description }));
-  // All employees, not just the ones referenced by cases: document creators
-  // (manifest createdById) are only known after downloadDocuments.js runs, so
-  // uploadCases.js filters to the employees actually referenced at upload time
-  const employees = Object.entries(employeeMap)
-    .map(([id, employee]) => ({ id, ...employee }));
-
-  fs.writeFileSync(STRUCTURED_FILE, JSON.stringify({ cases, causes, conditions, employmentStatuses, statuses, categories, requirements, employees }, null, 2));
-}
-
 function readCaseList() {
   return fs.readFileSync(LIST_FILE, 'utf8')
     .split('\n')
@@ -348,43 +35,69 @@ function readCaseList() {
 }
 
 (async () => {
+  const ledger = loadLedger(paths.root);
   const caseIds = readCaseList();
-  const cases = {};
+  // Resume: 'done' cases are skipped; 'failed' and never-attempted cases run.
+  // Wipe via the CLI (or delete migrationState.json) to re-export everything.
+  const pending = caseIds.filter(id => ledger.stageStatus(id, 'export') !== 'done');
 
-  console.error(`Total: ${caseIds.length} cases to fetch`);
+  console.error(`Total: ${caseIds.length} case(s) in list, ${caseIds.length - pending.length} already exported, ${pending.length} to fetch`);
 
-  const browser = await chromium.launch({ headless: true });
-  const context = await browser.newContext();
-
-  console.error('Logging in...');
-  const token = await login(context, USERNAME, PASSWORD);
-  console.error('Logged in\n');
-
-  console.error('Fetching lookup lists...');
-  const lookups = await getAllLookups(context, token);
-  console.error('Done fetching lookups\n');
-
-  console.error('Fetching employee list...');
-  const employeeList = await getEmployeeList(context, token);
-  console.error('Done fetching employees\n');
-
-  let done = 0;
-  for (const caseId of caseIds) {
-    done++;
-    const progress = `[${done}/${caseIds.length}]`;
-    try {
-      process.stderr.write(`${progress} Capturing case ${caseId}... `);
-      const endpoints = await captureCase(context, token, caseId);
-      cases[caseId] = { fetchedAt: new Date().toISOString(), endpoints };
-      saveCases(cases, lookups, employeeList);
-      console.error('done');
-    } catch (err) {
-      console.error(`FAILED: ${err.message}`);
-      cases[caseId] = { fetchedAt: new Date().toISOString(), error: err.message };
-      saveCases(cases, lookups, employeeList);
-    }
+  if (!pending.length) {
+    console.error('Nothing to export — all cases are already done.');
+    return;
   }
 
-  console.error(`\nFinished. ${done}/${caseIds.length} cases processed.`);
-  await browser.close();
+  fs.mkdirSync(paths.dataDir, { recursive: true });
+
+  console.error('Logging in...');
+  const client = await createClient({ username: USERNAME, password: PASSWORD });
+  console.error('Logged in\n');
+
+  console.error('Fetching lookup + employee lists...');
+  const [lookups, employeeList] = await Promise.all([
+    client.getAllLookups(),
+    client.getEmployeeList(),
+  ]);
+  const lookup = buildLookupMap(lookups);
+  const employeeMap = buildEmployeeMap(employeeList);
+  fs.writeFileSync(paths.sharedFile, JSON.stringify({
+    fetchedAt: new Date().toISOString(),
+    lookups,
+    employees: Object.entries(employeeMap).map(([id, e]) => ({ id, ...e })),
+  }, null, 2));
+  console.error(`Saved lookups + ${employeeList.length} employee(s) to ${path.basename(paths.sharedFile)}\n`);
+
+  let completed = 0;
+  let failed = 0;
+  await mapPool(pending, CASE_CONCURRENCY, async (caseId) => {
+    try {
+      const endpoints = await client.captureCase(caseId);
+      const structured = buildStructuredCase(caseId, endpoints, lookup, employeeMap);
+      fs.writeFileSync(
+        path.join(paths.dataDir, `${caseId}.json`),
+        JSON.stringify({ fetchedAt: new Date().toISOString(), endpoints, structured }, null, 2),
+      );
+      ledger.updateStage(caseId, 'export', {
+        status: 'done',
+        hasClient: !!structured,
+        counts: countsFor(structured),
+        error: undefined,
+      });
+      completed++;
+      console.error(`[${completed + failed}/${pending.length}] Case ${caseId} exported${structured ? '' : ' (no Client contact — not importable)'}`);
+    } catch (err) {
+      if (isBrowserGone(err)) {
+        console.error('\nAborted: the browser was closed mid-run (Ctrl+C?). Re-run to resume.');
+        process.exit(1);
+      }
+      failed++;
+      ledger.updateStage(caseId, 'export', { status: 'failed', error: err.message });
+      console.error(`[${completed + failed}/${pending.length}] Case ${caseId} FAILED: ${err.message}`);
+    }
+  });
+
+  console.error(`\nFinished. ${completed}/${pending.length} case(s) exported${failed ? `, ${failed} FAILED (re-run to retry)` : ''}.`);
+  if (failed) process.exitCode = 1;
+  await client.close();
 })();

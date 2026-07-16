@@ -2,16 +2,22 @@
   "name": "migration-machine",
   "version": "1.0.0",
   "description": "",
-  "main": "index.js",
+  "main": "cli.js",
+  "bin": {
+    "migrate": "./cli.js"
+  },
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node cli.js",
+    "migrate": "node cli.js"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
+    "@clack/prompts": "^1.7.0",
     "dotenv": "^17.4.2",
+    "picocolors": "^1.1.1",
     "playwright": "^1.61.1"
   }
 }

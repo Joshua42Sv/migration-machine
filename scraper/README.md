@@ -1,7 +1,7 @@
 # Case Manager scraper
 
 Pulls case data and documents out of Case Manager (`workcom.casemanager.biz`) for
-migration to a new system. Everything goes through Case Manager's own JSON API
+migration to NotusPoint. Everything goes through Case Manager's own JSON API
 directly (via Playwright's `context.request`) rather than clicking through the
 UI, so it's fast and doesn't need a visible browser.
 
@@ -23,114 +23,202 @@ npx playwright install chromium
 
 ## `caseList.txt`
 
-A plain text file, one case number per line. This is the input for `runAll.js`
-and `downloadDocuments.js` — populate it with every case you want to migrate.
+You supply this file: one Case Manager case ID per line, in this directory.
+Every stage reads it as its work list. To migrate a different set of cases,
+replace the file (and wipe migration state if starting over).
 
-`findCaseListEndpoint.js` can generate this automatically from the case grid:
+## Interactive CLI (recommended)
 
 ```
-node findCaseListEndpoint.js
+npm start        # or just `migrate` (globally linked via npm link)
 ```
 
-Logs in, reads every case number loaded into the case list grid's Kendo
-DataSource, and writes them to `caseList.txt`.
+Launches a menu that drives the whole pipeline:
 
-## Commands
+- **🚀 Full migration (fresh)** — wipes all migration state (after
+  confirmation), exports case data, downloads documents, then uploads to
+  the NotusPoint importer.
+- **▶️ Resume / retry** — continues where the last run left off. Every stage
+  skips cases already marked done in the ledger and retries failed ones, so
+  a crash at case 2,400 of 3,000 restarts in seconds.
+- **🎯 Migrate one case** — prompts for a case ID and runs the pipeline for
+  just that case in an isolated `single/<caseId>/` workspace (its own data,
+  documents and ledger via `MIGRATION_ROOT`), never touching the full run.
+- **📦 / 📄 / ⬆️** — run any individual stage on its own (all
+  resume-aware). The upload step lets you pick the full export or any
+  single-case workspace, and can skip file uploads.
+- **✅ Verify migration** — cross-checks the ledger against `caseList.txt`
+  and the files on disk: export done per case, documents
+  expected = downloaded = present on disk, case/files/costs uploaded, and
+  warnings for costs that imported without their file link. Writes the full
+  detail to `verifyReport.json`.
+- **📊 Status** — per-stage progress counts and importer reachability.
+- **🧹 Wipe migration state** — three flavours: **everything** (start
+  completely afresh), **upload records only** (after clearing the NotusPoint
+  DB — keeps all scraped data so re-uploading needs no re-scrape), or a
+  custom selection of components.
+- **🔒 Purge sensitive data** — deletes every file containing client/staff
+  data scraped from Case Manager (`data/`, `documents/`, `shared.json`, the
+  ledger, single-case workspaces, legacy exports) so only code and config
+  remain — for before letting AI tooling (or anyone else) loose on the
+  repo. `caseList.txt` (just case ids) and `.env` are kept.
 
-### `node getCase.js <caseId>`
+## The ledger (`migrationState.json`)
 
-Fetches a single case (case data + contacts) and merges it into `cases.json`.
-Useful for testing against one case. Defaults to case `13098` if no ID is given.
+Every stage records per-case progress in `migrationState.json`:
+
+```json
+{
+  "staff":  { "<employeeId>": { "email": "...", "userId": "<notuspoint-user-id>" } },
+  "cases": {
+    "13938": {
+      "export":    { "status": "done", "hasClient": true, "counts": { "contacts": 3, "billingTemplates": 2, "billingItems": 9, "costs": 12 } },
+      "documents": { "status": "done", "expected": 41, "downloaded": 41, "failed": 0 },
+      "upload": {
+        "case":  { "status": "done" },
+        "files": { "status": "done", "expected": 41, "uploaded": 41, "failed": 0 },
+        "costs": { "status": "done", "expected": 12, "imported": 12, "skippedUnlinked": 0, "missingFileLinks": 0 }
+      }
+    }
+  }
+}
+```
+
+Statuses: absent/`pending` (not attempted), `failed` (retried on the next
+run), `done` (skipped on resume). Deleting the file — or the CLI's wipe —
+makes everything start from scratch.
+
+Per-file upload progress (Case Manager `documentId` → NotusPoint file id)
+lives in `documents/<caseId>/.uploadState.json`, saved after **every** file,
+so a crash mid-case never duplicates files the importer already accepted; it
+also carries the ids costs need for their file links on a resumed run.
+
+The `staff` map remembers which NotusPoint user each Case Manager employee
+became, so resumed uploads never re-POST staff (the importer rejects
+duplicates) and can still resolve cost/file owners.
+
+## Performance & tuning
+
+All Case Manager traffic goes through one global in-flight cap
+(`lib/cmClient.js`) — that cap is the rate limiter (no fixed sleeps).
+Transient failures (WAF 429s, 5xx, network) retry with exponential backoff
+while holding their slot, so errors slow the run down instead of failing
+cases; an expired session triggers one shared re-login that all in-flight
+requests wait on. Knobs (env vars):
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `CM_MAX_INFLIGHT` | 16 | Max concurrent requests to Case Manager (the real throttle — lower it if the WAF objects) |
+| `CM_CASE_CONCURRENCY` | 6 export / 3 docs | Cases processed at once per stage |
+| `CM_FORCE_GETDATA` | unset | Set to `1` to always fetch per-document GetData even when the list rows carry `CreatedByID` |
+| `UPLOAD_CASE_CONCURRENCY` | 3 | Cases uploaded at once |
+| `UPLOAD_FILE_CONCURRENCY` | 8 | Concurrent file POSTs to the importer (global, across all cases) |
+
+**Download and upload can run at the same time** (two terminals): the
+uploader only touches cases whose `documents` stage is `done` in the ledger,
+so run `downloadDocuments.js` in one terminal and re-run `uploadCases.js`
+periodically in another to drain finished cases during the download window.
+
+Before the full 3,000-case run, push a ~20-case batch through and watch for
+CM 403s (WAF) — if they appear, lower `CM_MAX_INFLIGHT`. The ledger means an
+aborted experiment costs nothing but time.
+
+## Underlying scripts
+
+All scripts write under `MIGRATION_ROOT` (default: this directory) — that's
+how the CLI isolates single-case workspaces.
 
 ### `node runAll.js [caseListFile]`
 
-The main data export. Logs in once, fetches the shared lookup lists (Category,
-Status, Cause, Condition, etc.) once, then loops over every case ID in
-`caseList.txt` (or a path you pass in) fetching case data + contacts.
-
-Writes:
-- `cases.json` — raw API responses per case (including the full client
-  contact record fetched from `/CaseContact/GetData`)
-- `structuredData.json` — client/case fields shaped to match the importer
-  API's `CaseImportDto` (`clientFirstName`, `clientAddress`, `claimNumber`,
-  `referralDate`, etc.), plus cause/condition/employment status
-  descriptions and the distinct values referenced
-
-The client's address (`clientAddress`) is always included; a separate
-billing address (`clientBillingAddress`) is only included when the case
-contact has `Address2UsePrimary` set to false in Case Manager.
-
-The referrer (`referrer`) is the case contact whose roles include
-"Referrer" — a contact can hold this alongside other roles (e.g. "Bill To,
-Referrer"), so it's matched on role membership rather than primary role.
-
-**Note:** this overwrites `cases.json`/`structuredData.json` on every run — it
-does not merge with a previous run's output. Run it against the full
-`caseList.txt`, not incrementally.
-
-### `node uploadCases.js [structuredDataFile]`
-
-Reads `structuredData.json` and POSTs each case, one at a time, to the
-production importer API (`http://localhost:8080/api/importer/case` by
-default, override with `IMPORT_URL`). Failures for individual cases are
-logged and don't stop the run; a summary of failed case IDs is printed at
-the end.
-
-Each case uploads in three passes so costs can link to the files created
-from their Case Manager documents:
-
-1. Case + billing templates (no costs) to `/api/importer/case`.
-2. Documents: reads `documents/{caseId}/manifest.json` and POSTs each file
-   as `multipart/form-data` to `http://localhost:8080/api/importer/case/file`
-   (override with `IMPORT_FILE_URL`). Each response's file ID is recorded
-   against the manifest entry's Case Manager `documentId`.
-3. Costs to `http://localhost:8080/api/importer/case/costs` (override with
-   `IMPORT_COSTS_URL`), with each cost's `fileId` resolved from its
-   `documentId` via the map built in pass 2. Costs whose document has no
-   uploaded file import without the link and are counted in the log.
-
-Each file uploads as the NotusPoint user created for the Case Manager
-employee who created the document (manifest `createdById`), falling back
-to the case's assigned user, then any imported staff member. Staff are
-imported only for employees referenced somewhere: cost loggers, assigned
-case users, and document creators. File and cost failures are logged and
-tallied separately from case failures; run `downloadDocuments.js` first so
-manifests exist (both it and `runAll.js` must be re-run whenever manifest
-or structured-data fields are added, e.g. `documentId`/`createdById`).
+The data export. Logs in once, fetches the shared lookup lists and employee
+list (saved to `shared.json`), then captures every case ID in
+`caseList.txt` not yet exported (`CM_CASE_CONCURRENCY` cases at a time,
+with contact/estimate/cost detail fetches in parallel within each case).
+Each case is saved to `data/<caseId>.json` as `{ fetchedAt, endpoints,
+structured }` where `structured` is the importer-ready record (built by
+`lib/structured.js`; `null` when the case has no Client contact).
 
 ### `node downloadDocuments.js [caseListFile]`
 
-Downloads every document attached to each case in `caseList.txt` into
+Downloads every document attached to each not-yet-done case into
 `documents/{caseId}/`:
 - Real uploaded files (PDF, Word, etc.) are downloaded as-is with their
   original filename.
 - In-app emails (`.eml`) are reconstructed as real `.eml` files (From/To/Cc/
-  Subject/Date headers + HTML body) so they open in any mail client.
+  Subject/Date headers + HTML body + attachments) so they open in any mail
+  client.
 - In-app formatted-text notes (`.cmrtf`) are saved as `.html`, preserving
   formatting.
 - Each case directory also gets a `manifest.json` listing every file's
   original Case Manager title and a `fileType` (`EMAIL`, `CASE_NOTE`,
   `PDF`, `WORD`, `EXCEL`, `IMAGE`) used by `uploadCases.js`.
 
-**Note:** this deletes and fully recreates the whole `documents/` directory
-on every run — it does not do an incremental/resumable download.
+Incremental: only cases not marked done are (re)downloaded, each case's
+directory rebuilt in full so its manifest is always consistent. Documents
+across all in-flight cases download in parallel through the global
+`CM_MAX_INFLIGHT` pool. For real files, the per-document `GetData` call
+(needed only for `CreatedByID`) is skipped when the document list rows
+already carry it — probed automatically on the first case — nearly halving
+Case Manager requests on document-heavy cases.
+
+### `node uploadCases.js [--skip-files] [--costs-without-files]`
+
+Uploads staff, then each importable case to the production importer API
+(`http://localhost:8080/api/importer/case` by default, override with
+`IMPORT_URL` / `IMPORT_FILE_URL` / `IMPORT_STAFF_URL` / `IMPORT_COSTS_URL`).
+
+Each case uploads in three passes so costs can link to the files created
+from their Case Manager documents:
+
+1. Case + billing templates (no costs) to `/api/importer/case`.
+2. Documents: reads `documents/{caseId}/manifest.json` and POSTs each file
+   as `multipart/form-data`, recording each created file id against the
+   manifest entry's Case Manager `documentId`.
+3. Costs to `/api/importer/case/costs`, with each cost's `fileId` resolved
+   from its `documentId`. While a case still has failed file uploads its
+   costs are held back ("blocked") so a later resume can import them WITH
+   their file links; `--costs-without-files` forces them through instead.
+
+Each file uploads as the NotusPoint user created for the Case Manager
+employee who created the document (manifest `createdById`), falling back
+to the case's assigned user, then any imported staff member. Staff are
+imported only for employees referenced somewhere: cost loggers, assigned
+case users, and document creators.
+
+Fully resume-aware: cases/files/costs/staff already accepted by the
+importer are skipped via the ledger and the per-case `.uploadState.json`.
+Only cases whose `documents` stage is `done` are touched (so it can run
+alongside the downloader); file POSTs run `UPLOAD_FILE_CONCURRENCY` at a
+time across `UPLOAD_CASE_CONCURRENCY` concurrent cases. `--skip-files`
+uploads cases and costs only (costs then import without file links) — only
+for quick data-checking runs.
+
+### `node getCase.js <caseId>`
+
+Legacy single-case fetch into `cases.json`. Superseded by the CLI's
+"Migrate one case" — kept for ad-hoc poking at raw responses.
 
 ## Suggested order for a full migration run
 
-1. `node findCaseListEndpoint.js` — build the full `caseList.txt`
+Use the CLI (`npm start` → 🚀 or ▶️). Manually it's:
+
+1. Populate `caseList.txt` — one case ID per line
 2. `node runAll.js` — export case + contact data
-3. `node downloadDocuments.js` — download all documents
-4. `node uploadCases.js` — import case data into the new production system
+3. `node downloadDocuments.js` — download all documents (can overlap with 4)
+4. `node uploadCases.js` — import into the new production system; re-run to
+   drain cases as their documents finish
+5. CLI → ✅ Verify migration — confirm everything landed
 
-## Known limitations / things to check before a large (~2,000 case) run
+Re-running any step resumes/retries; wipe via the CLI to start over.
 
-- No rate limiting or backoff — Case Manager sits behind an AWS WAF that has
-  already been observed blocking malformed requests; a large burst of API
-  traffic has not been tested for rate limits.
-- No resume support — both scripts start fresh each run, so a failure partway
-  through a large batch means starting over, not resuming.
-- The anti-forgery token is fetched once at login; untested whether it or the
-  session expires during a very long run.
+## Known limitations / things to check before the production (~3,000 case) run
+
+- The WAF's tolerance for `CM_MAX_INFLIGHT=16` is untested — trial a ~20-case
+  batch and watch for 403s before the full run.
 - Document handling has only been verified against `.pdf`, `.docx`, `.eml`,
   and `.cmrtf` from a handful of cases — other document/record types may
   appear at scale and aren't explicitly handled yet.
+- Hardcoded `customerId` / `requirementId` TODOs in `uploadCases.js` must be
+  replaced before a production run.
+- Verification is against the ledger + local disk; it does not (yet) query
+  NotusPoint to independently confirm record counts.

@@ -1,15 +1,22 @@
 require("dotenv").config();
 const fs = require("fs");
 const path = require("path");
+const { roots } = require("./lib/paths");
+const { loadLedger } = require("./lib/ledger");
+const { createLimiter, mapPool } = require("./lib/pool");
 
 const args = process.argv.slice(2);
 // --skip-files: upload cases and costs only; costs then import without file
 // links, so only use this for quick data-checking runs
 const SKIP_FILES = args.includes("--skip-files");
-const STRUCTURED_FILE =
-  args.find((a) => !a.startsWith("--")) ||
-  path.join(__dirname, "structuredData.json");
-const DOCUMENTS_DIR = path.join(__dirname, "documents");
+// --costs-without-files: normally costs wait ("blocked") while a case still
+// has failed file uploads, so a later resume can import them with their file
+// links intact; this forces them through without the links instead
+const COSTS_WITHOUT_FILES = args.includes("--costs-without-files");
+
+const paths = roots();
+const DATA_DIR = paths.dataDir;
+const DOCUMENTS_DIR = paths.documentsDir;
 const IMPORT_URL =
   process.env.IMPORT_URL || "http://localhost:8080/api/importer/case";
 const IMPORT_FILE_URL =
@@ -19,10 +26,14 @@ const IMPORT_STAFF_URL =
 const IMPORT_COSTS_URL =
   process.env.IMPORT_COSTS_URL ||
   "http://localhost:8080/api/importer/case/costs";
+// Cases uploaded at once; each case's file POSTs additionally share the
+// global file limiter below, which is what actually bounds importer load.
+const CASE_CONCURRENCY = Number(process.env.UPLOAD_CASE_CONCURRENCY ?? 3);
+const FILE_CONCURRENCY = Number(process.env.UPLOAD_FILE_CONCURRENCY ?? 8);
 
-if (!fs.existsSync(STRUCTURED_FILE)) {
-  console.error(`Structured data file not found: ${STRUCTURED_FILE}`);
-  console.error("Run runAll.js first to generate structuredData.json");
+if (!fs.existsSync(DATA_DIR) || !fs.existsSync(paths.sharedFile)) {
+  console.error(`Export data not found (${DATA_DIR} / ${paths.sharedFile})`);
+  console.error("Run runAll.js first to export case data");
   process.exit(1);
 }
 
@@ -236,6 +247,26 @@ function loadManifest(caseId) {
   return JSON.parse(fs.readFileSync(manifestPath, "utf8"));
 }
 
+// Per-case file-upload progress (documentId -> NotusPoint file id) lives next
+// to the files and is re-saved after EVERY file, so a crash mid-case never
+// re-uploads (and so duplicates) files the importer already accepted. It also
+// carries the ids costs need for their file links on a resumed run.
+function uploadStatePath(caseId) {
+  return path.join(DOCUMENTS_DIR, caseId, ".uploadState.json");
+}
+
+function loadUploadState(caseId) {
+  try {
+    return JSON.parse(fs.readFileSync(uploadStatePath(caseId), "utf8"));
+  } catch {
+    return { byDocumentId: {} };
+  }
+}
+
+function saveUploadState(caseId, state) {
+  fs.writeFileSync(uploadStatePath(caseId), JSON.stringify(state, null, 2));
+}
+
 async function uploadCaseFile(caseId, entry, uploadedById) {
   const filePath = path.join(DOCUMENTS_DIR, caseId, entry.filename);
   const buffer = fs.readFileSync(filePath);
@@ -277,15 +308,54 @@ async function uploadCosts(caseId, costs) {
 }
 
 (async () => {
-  const { cases, employees } = JSON.parse(
-    fs.readFileSync(STRUCTURED_FILE, "utf8"),
-  );
+  const ledger = loadLedger(paths.root);
+  const { employees } = JSON.parse(fs.readFileSync(paths.sharedFile, "utf8"));
+
+  // Importable records come from the per-case export files; raw endpoint data
+  // is dropped as each file is read so only the small structured records stay
+  // in memory. Cases without a Client contact export as structured:null and
+  // are not importable.
+  const caseIds = fs
+    .readdirSync(DATA_DIR)
+    .filter((f) => f.endsWith(".json"))
+    .map((f) => path.basename(f, ".json"))
+    .sort((a, b) => Number(a) - Number(b));
+  const cases = [];
+  let noClient = 0;
+  for (const caseId of caseIds) {
+    const { structured } = JSON.parse(
+      fs.readFileSync(path.join(DATA_DIR, `${caseId}.json`), "utf8"),
+    );
+    if (structured) cases.push(structured);
+    else noClient++;
+  }
+  if (noClient) {
+    console.error(`${noClient} exported case(s) have no Client contact - not importable, skipped`);
+  }
+
+  // Only cases whose documents are fully downloaded upload (unless
+  // --skip-files); that makes it safe to run this WHILE downloadDocuments.js
+  // is still going — re-run it (or loop it) to drain newly finished cases.
+  const ready = [];
+  let waitingDocs = 0;
+  for (const caseRecord of cases) {
+    if (!SKIP_FILES && ledger.stageStatus(caseRecord.caseId, "documents") !== "done") {
+      waitingDocs++;
+      continue;
+    }
+    ready.push(caseRecord);
+  }
+  if (waitingDocs) {
+    console.error(
+      `${waitingDocs} case(s) still waiting for their document download - run the uploader again later to pick them up`,
+    );
+  }
 
   // Only employees actually referenced somewhere become NotusPoint users:
   // cost loggers, assigned case users, and document creators (from the
   // manifests, so files can be uploaded as the user who created them)
   const neededEmployeeIds = new Set();
-  for (const caseRecord of cases) {
+  for (const caseRecord of ready) {
     if (caseRecord.assignedUserId) {
       neededEmployeeIds.add(caseRecord.assignedUserId);
     }
@@ -298,19 +368,32 @@ async function uploadCosts(caseId, costs) {
   }
   const staff = employees.filter((e) => neededEmployeeIds.has(e.id));
 
+  // Staff already imported on a previous run are reused from the ledger (the
+  // importer rejects duplicates, and their user ids are needed either way)
+  const resolvedEmailByEmployeeId = new Map();
+  const resolvedUserIdByEmployeeId = new Map();
+  const pendingStaff = [];
+  for (const employee of staff) {
+    const known = ledger.state.staff[employee.id];
+    if (known?.userId) {
+      resolvedEmailByEmployeeId.set(employee.id, known.email);
+      resolvedUserIdByEmployeeId.set(employee.id, known.userId);
+    } else {
+      pendingStaff.push(employee);
+    }
+  }
+
   console.error(
-    `Total: ${staff.length} staff to upload (${employees.length - staff.length} unreferenced employee(s) skipped)`,
+    `Total: ${staff.length} staff referenced, ${staff.length - pendingStaff.length} already uploaded, ${pendingStaff.length} to upload`,
   );
   console.error(`Target: ${IMPORT_STAFF_URL}\n`);
 
   const failedStaff = [];
-  const resolvedEmailByEmployeeId = new Map();
-  const resolvedUserIdByEmployeeId = new Map();
   let staffDone = 0;
 
-  for (const employee of staff) {
+  for (const employee of pendingStaff) {
     staffDone++;
-    const progress = `[${staffDone}/${staff.length}]`;
+    const progress = `[${staffDone}/${pendingStaff.length}]`;
     const dto = toStaffImportDto(employee);
     resolvedEmailByEmployeeId.set(employee.id, dto.email);
 
@@ -318,6 +401,7 @@ async function uploadCosts(caseId, costs) {
       process.stderr.write(`${progress} Uploading staff ${dto.email}... `);
       const user = await uploadStaff(dto);
       if (user?.id) resolvedUserIdByEmployeeId.set(employee.id, user.id);
+      ledger.setStaff(employee.id, { email: dto.email, userId: user?.id ?? "" });
       console.error("done");
     } catch (err) {
       console.error(`FAILED: ${err.message}`);
@@ -325,11 +409,13 @@ async function uploadCosts(caseId, costs) {
     }
   }
 
-  console.error(
-    `\nFinished. ${staffDone - failedStaff.length}/${staffDone} staff uploaded successfully.\n`,
-  );
+  if (pendingStaff.length) {
+    console.error(
+      `\nFinished staff. ${staffDone - failedStaff.length}/${staffDone} uploaded successfully.\n`,
+    );
+  }
 
-  console.error(`Total: ${cases.length} cases to upload`);
+  console.error(`Total: ${ready.length} case(s) ready to upload`);
   console.error(`Target: ${IMPORT_URL}`);
   if (SKIP_FILES) {
     console.error("--skip-files: file uploads disabled, costs will have no file links");
@@ -339,92 +425,170 @@ async function uploadCosts(caseId, costs) {
   const failed = [];
   const failedFiles = [];
   const failedCosts = [];
-  let done = 0;
+  let alreadyComplete = 0;
   let filesUploaded = 0;
+  let filesSkipped = 0;
+  let costsBlocked = 0;
+  let completedCases = 0;
+  // Bounds concurrent file POSTs across ALL case workers, so importer load
+  // stays capped no matter how case work is distributed
+  const fileLimiter = createLimiter(FILE_CONCURRENCY);
 
   // Order per case: case (with billing templates) -> files -> costs, so costs
-  // can reference the file ids the file import created.
-  for (const caseRecord of cases) {
-    done++;
-    const progress = `[${done}/${cases.length}]`;
-    const dto = toCaseImportDto(caseRecord, resolvedEmailByEmployeeId);
+  // can reference the file ids the file import created. Each part is tracked
+  // in the ledger and skipped once done, so a resumed run never re-POSTs
+  // (and so never duplicates) work the importer already accepted.
+  // Returns a summary string for the progress line, or null when the case was
+  // already fully uploaded.
+  async function uploadOneCase(caseRecord) {
+    const caseId = caseRecord.caseId;
+    const up = ledger.getCase(caseId).upload ?? {};
+    const parts = [];
 
-    try {
-      process.stderr.write(`${progress} Uploading case ${dto.caseId}... `);
-      await uploadCase(dto);
-      console.error("done");
-    } catch (err) {
-      console.error(`FAILED: ${err.message}`);
-      failed.push({ caseId: dto.caseId, error: err.message });
-      continue;
+    const manifest = SKIP_FILES ? [] : loadManifest(caseId);
+    const caseDone = up.case?.status === "done";
+    const filesDone = up.files?.status === "done" && (up.files.uploaded ?? 0) >= manifest.length;
+    const costsDone = up.costs?.status === "done";
+    if (caseDone && filesDone && costsDone) {
+      alreadyComplete++;
+      return null;
     }
 
-    // Each file uploads as the user who created the document in Case
-    // Manager; when that can't be resolved (no createdById, or the staff
-    // upload failed) fall back to the case's assigned user, then any
-    // imported staff member
+    // 1. The case itself (with billing templates)
+    if (!caseDone) {
+      const dto = toCaseImportDto(caseRecord, resolvedEmailByEmployeeId);
+      try {
+        await uploadCase(dto);
+        ledger.updateStage(caseId, "upload", { case: { status: "done" } });
+        parts.push("case ok");
+      } catch (err) {
+        ledger.updateStage(caseId, "upload", { case: { status: "failed", error: err.message } });
+        failed.push({ caseId, error: err.message });
+        return `case FAILED: ${err.message}`;
+      }
+    }
+
+    // 2. Files, in parallel through the shared limiter. Each uploads as the
+    // user who created the document in Case Manager; when that can't be
+    // resolved (no createdById, or the staff upload failed) fall back to the
+    // case's assigned user, then any imported staff member
     const fallbackUploaderId =
       resolvedUserIdByEmployeeId.get(caseRecord.assignedUserId) ||
       resolvedUserIdByEmployeeId.values().next().value;
 
-    const fileIdByDocumentId = new Map();
-    const manifest = SKIP_FILES ? [] : loadManifest(dto.caseId);
-    for (const entry of manifest) {
-      const uploadedById =
-        resolvedUserIdByEmployeeId.get(entry.createdById) || fallbackUploaderId;
-      try {
-        process.stderr.write(`    Uploading file "${entry.title}"... `);
-        const file = await uploadCaseFile(dto.caseId, entry, uploadedById);
-        if (entry.documentId && file?.id) {
-          fileIdByDocumentId.set(entry.documentId, file.id);
-        }
-        filesUploaded++;
-        console.error("done");
-      } catch (err) {
-        console.error(`FAILED: ${err.message}`);
-        failedFiles.push({
-          caseId: dto.caseId,
-          filename: entry.filename,
-          error: err.message,
+    const uploadState = loadUploadState(caseId);
+    const entryKey = (entry) => entry.documentId || entry.filename;
+    const pendingEntries = manifest.filter(
+      (entry) => uploadState.byDocumentId[entryKey(entry)] === undefined,
+    );
+    filesSkipped += manifest.length - pendingEntries.length;
+
+    let caseFileFailures = 0;
+    await Promise.all(
+      pendingEntries.map((entry) =>
+        fileLimiter(async () => {
+          const uploadedById =
+            resolvedUserIdByEmployeeId.get(entry.createdById) || fallbackUploaderId;
+          try {
+            const file = await uploadCaseFile(caseId, entry, uploadedById);
+            uploadState.byDocumentId[entryKey(entry)] = file?.id ?? "";
+            saveUploadState(caseId, uploadState);
+            filesUploaded++;
+          } catch (err) {
+            caseFileFailures++;
+            failedFiles.push({ caseId, filename: entry.filename, error: err.message });
+            console.error(`  file "${entry.filename}" on case ${caseId} FAILED: ${err.message}`);
+          }
+        }),
+      ),
+    );
+    if (!SKIP_FILES) {
+      ledger.updateStage(caseId, "upload", {
+        files: {
+          status: caseFileFailures ? "failed" : "done",
+          expected: manifest.length,
+          uploaded: Object.keys(uploadState.byDocumentId).length,
+          failed: caseFileFailures,
+        },
+      });
+      parts.push(`files ${Object.keys(uploadState.byDocumentId).length}/${manifest.length}`);
+    }
+
+    // 3. Costs — one batch per case. While files are still failing the batch
+    // is held back ("blocked") so a later retry can import the costs WITH
+    // their file links; --costs-without-files forces them through instead.
+    if (!costsDone) {
+      if (caseFileFailures && !SKIP_FILES && !COSTS_WITHOUT_FILES) {
+        costsBlocked++;
+        ledger.updateStage(caseId, "upload", {
+          costs: { status: "blocked", note: "waiting for failed file uploads" },
         });
+        parts.push("costs held back (failed files; re-run to retry)");
+        return parts.join(", ");
+      }
+
+      const fileIdByDocumentId = new Map(
+        Object.entries(uploadState.byDocumentId).filter(([, id]) => id),
+      );
+      const { costs, skipped, unmatchedDocuments } = toCostImportDtos(
+        caseRecord,
+        resolvedUserIdByEmployeeId,
+        fileIdByDocumentId,
+      );
+      if (skipped) {
+        parts.push(`${skipped} cost(s) not linked to an estimate item - skipped`);
+      }
+      if (unmatchedDocuments && !SKIP_FILES) {
+        parts.push(`${unmatchedDocuments} cost(s) missing their file link`);
+      }
+      try {
+        if (costs.length) await uploadCosts(caseId, costs);
+        ledger.updateStage(caseId, "upload", {
+          costs: {
+            status: "done",
+            expected: (caseRecord.costs ?? []).length,
+            imported: costs.length,
+            skippedUnlinked: skipped,
+            missingFileLinks: unmatchedDocuments,
+            error: undefined,
+            note: undefined,
+          },
+        });
+        parts.push(`costs ${costs.length} imported`);
+      } catch (err) {
+        ledger.updateStage(caseId, "upload", {
+          costs: { status: "failed", error: err.message },
+        });
+        failedCosts.push({ caseId, error: err.message });
+        parts.push(`costs FAILED: ${err.message}`);
       }
     }
 
-    const { costs, skipped, unmatchedDocuments } = toCostImportDtos(
-      caseRecord,
-      resolvedUserIdByEmployeeId,
-      fileIdByDocumentId,
-    );
-    if (skipped) {
-      console.error(
-        `    ${skipped} cost(s) on case ${dto.caseId} not linked to an estimate item - skipped`,
-      );
-    }
-    if (unmatchedDocuments && !SKIP_FILES) {
-      console.error(
-        `    ${unmatchedDocuments} cost(s) on case ${dto.caseId} reference a document with no uploaded file - imported without file link`,
-      );
-    }
-    if (costs.length) {
-      try {
-        process.stderr.write(
-          `    Uploading ${costs.length} cost(s) for case ${dto.caseId}... `,
-        );
-        await uploadCosts(dto.caseId, costs);
-        console.error("done");
-      } catch (err) {
-        console.error(`FAILED: ${err.message}`);
-        failedCosts.push({ caseId: dto.caseId, error: err.message });
-      }
-    }
+    return parts.join(", ");
   }
 
+  await mapPool(ready, CASE_CONCURRENCY, async (caseRecord) => {
+    const summary = await uploadOneCase(caseRecord);
+    completedCases++;
+    if (summary) {
+      console.error(`[${completedCases}/${ready.length}] Case ${caseRecord.caseId}: ${summary}`);
+    }
+  });
+
+  const attempted = ready.length - alreadyComplete;
   console.error(
-    `\nFinished. ${done - failed.length}/${done} cases uploaded successfully.`,
+    `\nFinished. ${attempted - failed.length}/${attempted} case(s) uploaded successfully` +
+      (alreadyComplete ? ` (${alreadyComplete} already complete, skipped)` : "") + ".",
   );
   console.error(
-    `${filesUploaded} file(s) uploaded, ${failedFiles.length} failed.`,
+    `${filesUploaded} file(s) uploaded, ${filesSkipped} already uploaded, ${failedFiles.length} failed.`,
   );
+  if (waitingDocs) {
+    console.error(`${waitingDocs} case(s) still waiting for documents - re-run to pick them up.`);
+  }
+  if (costsBlocked) {
+    console.error(`${costsBlocked} case(s) have costs held back behind failed file uploads.`);
+  }
   if (failed.length) {
     console.error(`${failed.length} case(s) failed:`);
     for (const f of failed) console.error(`  - ${f.caseId}: ${f.error}`);
