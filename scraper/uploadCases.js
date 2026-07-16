@@ -28,8 +28,8 @@ const IMPORT_COSTS_URL =
   "http://localhost:8080/api/importer/case/costs";
 // Cases uploaded at once; each case's file POSTs additionally share the
 // global file limiter below, which is what actually bounds importer load.
-const CASE_CONCURRENCY = Number(process.env.UPLOAD_CASE_CONCURRENCY ?? 3);
-const FILE_CONCURRENCY = Number(process.env.UPLOAD_FILE_CONCURRENCY ?? 8);
+const CASE_CONCURRENCY = Number(process.env.UPLOAD_CASE_CONCURRENCY ?? 8);
+const FILE_CONCURRENCY = Number(process.env.UPLOAD_FILE_CONCURRENCY ?? 32);
 
 if (!fs.existsSync(DATA_DIR) || !fs.existsSync(paths.sharedFile)) {
   console.error(`Export data not found (${DATA_DIR} / ${paths.sharedFile})`);

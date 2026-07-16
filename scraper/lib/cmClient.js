@@ -57,7 +57,11 @@ function jsonOrThrow(status, ok, text, label) {
 async function createClient({
   username,
   password,
-  maxInFlight = Number(process.env.CM_MAX_INFLIGHT ?? 16),
+  // Default pushed high on purpose — CM latency (~1.5s/request) means
+  // throughput scales with in-flight count, and the backoff on 429/5xx
+  // self-throttles if the WAF pushes back. Lower via CM_MAX_INFLIGHT in .env
+  // if 403s appear (backoff doesn't help those — they fail the document).
+  maxInFlight = Number(process.env.CM_MAX_INFLIGHT ?? 64),
 } = {}) {
   const browser = await chromium.launch({ headless: true });
   const context = await browser.newContext();

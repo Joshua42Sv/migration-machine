@@ -34,13 +34,63 @@ function loadLedger(root) {
 
   function save() {
     // tmp + rename so a crash mid-write never leaves a half-written ledger
-    const tmp = `${file}.tmp`;
+    const tmp = `${file}.tmp-${process.pid}`;
     fs.writeFileSync(tmp, JSON.stringify(state, null, 2));
     fs.renameSync(tmp, file);
   }
 
+  // The downloader and uploader run at the same time against the same ledger
+  // (each stage only writes its own section). A lock file serialises their
+  // read-merge-write cycles; a crash can leave the lock behind, so a holder
+  // older than LOCK_STALE_MS is stolen, and rather than deadlock forever a
+  // write eventually proceeds unlocked (worst case one concurrent patch is
+  // lost and that stage simply reruns on the next resume).
+  const LOCK_STALE_MS = 5000;
+  const lockFile = `${file}.lock`;
+  function withLock(fn) {
+    const deadline = Date.now() + LOCK_STALE_MS * 2;
+    for (;;) {
+      try {
+        const fd = fs.openSync(lockFile, 'wx');
+        try {
+          return fn();
+        } finally {
+          fs.closeSync(fd);
+          fs.rmSync(lockFile, { force: true });
+        }
+      } catch (err) {
+        if (err.code !== 'EEXIST') throw err;
+        try {
+          if (Date.now() - fs.statSync(lockFile).mtimeMs > LOCK_STALE_MS) {
+            fs.rmSync(lockFile, { force: true });
+          }
+        } catch {}
+        if (Date.now() > deadline) return fn();
+        // Synchronous ~5ms sleep; these scripts have nothing else to do while
+        // a ledger write is pending, so blocking the event loop is fine
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
+      }
+    }
+  }
+
+  // Re-reads the file, applies one mutation to the fresh state, and persists —
+  // so concurrent processes never erase each other's sections. In-memory state
+  // is replaced by the fresh copy (exposed via the `state` getter below).
+  function patchAndSave(apply) {
+    withLock(() => {
+      try {
+        const fresh = JSON.parse(fs.readFileSync(file, 'utf8'));
+        fresh.staff ??= {};
+        fresh.cases ??= {};
+        state = fresh;
+      } catch {} // missing/unreadable: keep our in-memory state
+      apply();
+      save();
+    });
+  }
+
   return {
-    state,
+    get state() { return state; },
     file,
     save,
     getCase(caseId) {
@@ -52,13 +102,15 @@ function loadLedger(root) {
     // Shallow-merges patch into the stage section and persists immediately.
     // Pass an explicit `error: undefined` to clear a stale error on success.
     updateStage(caseId, stage, patch) {
-      const caseEntry = (state.cases[caseId] ??= {});
-      caseEntry[stage] = { ...caseEntry[stage], ...patch, at: new Date().toISOString() };
-      save();
+      patchAndSave(() => {
+        const caseEntry = (state.cases[caseId] ??= {});
+        caseEntry[stage] = { ...caseEntry[stage], ...patch, at: new Date().toISOString() };
+      });
     },
     setStaff(employeeId, record) {
-      state.staff[employeeId] = { ...record, at: new Date().toISOString() };
-      save();
+      patchAndSave(() => {
+        state.staff[employeeId] = { ...record, at: new Date().toISOString() };
+      });
     },
   };
 }

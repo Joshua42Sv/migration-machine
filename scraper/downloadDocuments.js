@@ -15,10 +15,14 @@ const OUTPUT_DIR = paths.documentsDir;
 // download across all cases sharing the client's global CM_MAX_INFLIGHT
 // pool — one 700-document case alone keeps the whole pool busy, so this
 // mainly avoids stalling at case boundaries.
-const CASE_CONCURRENCY = Number(process.env.CM_CASE_CONCURRENCY ?? 3);
-// The /CaseDocument/_List rows may already carry CreatedByID; when they do,
-// per-file /CaseDocument/GetData calls are skipped (nearly halving CM
-// requests). Set CM_FORCE_GETDATA=1 to always fetch GetData instead.
+const CASE_CONCURRENCY = Number(process.env.CM_CASE_CONCURRENCY ?? 8);
+// Real files never fetch per-file /CaseDocument/GetData — it was only needed
+// for CreatedByID, and doubling every file's CM requests for attribution
+// alone is the single biggest cost of the download. CreatedByID is taken
+// from the /CaseDocument/_List row when present; otherwise the uploader
+// attributes the file to the case's assigned user. Set CM_FORCE_GETDATA=1
+// to restore per-file GetData (exact attribution at ~2x the requests).
+// Emails/notes always fetch GetData — their bodies live there.
 const FORCE_GETDATA = process.env.CM_FORCE_GETDATA === '1';
 
 if (!USERNAME || !PASSWORD) {
@@ -168,8 +172,7 @@ function classifyFileType(doc) {
   const client = await createClient({ username: USERNAME, password: PASSWORD });
   console.error('Logged in\n');
 
-  // null = not probed yet; decided from the first non-empty document list
-  let listHasCreatedBy = FORCE_GETDATA ? false : null;
+  let attributionNoted = false;
   let totalDocs = 0;
 
   // data is the /CaseDocument/GetData record (needed for email/note bodies;
@@ -201,9 +204,7 @@ function classifyFileType(doc) {
   // released as each download completes, so memory stays flat.
   async function downloadOne(caseId, caseDir, taken, doc) {
     try {
-      // Real files only need GetData for CreatedByID; skip it when the list
-      // row already has one
-      const needData = !doc.IsFile || !listHasCreatedBy;
+      const needData = !doc.IsFile || FORCE_GETDATA;
       const data = needData ? await client.getCaseDocumentData(caseId, doc.ID) : null;
       const { buffer, filename } = doc.IsFile
         ? await client.downloadDocumentFile(doc.ID)
@@ -237,11 +238,13 @@ function classifyFileType(doc) {
   async function processCase(caseId) {
     const documents = await client.getCaseDocuments(caseId);
 
-    if (listHasCreatedBy === null && documents.length) {
-      listHasCreatedBy = documents.every((d) => 'CreatedByID' in d);
-      console.error(listHasCreatedBy
-        ? '  document list rows carry CreatedByID — skipping per-file GetData calls'
-        : '  document list rows have no CreatedByID — fetching GetData per document');
+    if (!attributionNoted && documents.length) {
+      attributionNoted = true;
+      if (FORCE_GETDATA) {
+        console.error('  CM_FORCE_GETDATA=1 — fetching GetData per file for exact creator attribution');
+      } else if (!documents.every((d) => 'CreatedByID' in d)) {
+        console.error("  document list rows have no CreatedByID — files upload as the case's assigned user (CM_FORCE_GETDATA=1 for exact attribution)");
+      }
     }
 
     if (documents.length === 0) {

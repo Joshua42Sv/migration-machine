@@ -31,29 +31,31 @@ function ts() {
   return pc.dim(`[${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}]`);
 }
 
-// Re-emits a child stream line by line with the timestamp appended, so the
-// stage scripts' own progress output stays untouched at the source.
-function stampLines(src, dest) {
+// Re-emits a child stream line by line with the timestamp appended (and a
+// tag prefixed when two stages interleave), so the stage scripts' own
+// progress output stays untouched at the source.
+function stampLines(src, dest, tag) {
+  const prefix = tag ? `${tag} ` : '';
   let buf = '';
   src.setEncoding('utf8');
   src.on('data', (chunk) => {
     buf += chunk;
     const lines = buf.split('\n');
     buf = lines.pop();
-    for (const line of lines) dest.write(line.trim() ? `${line} ${ts()}\n` : `${line}\n`);
+    for (const line of lines) dest.write(line.trim() ? `${prefix}${line} ${ts()}\n` : `${line}\n`);
   });
-  src.on('end', () => { if (buf) dest.write(`${buf} ${ts()}\n`); });
+  src.on('end', () => { if (buf) dest.write(`${prefix}${buf} ${ts()}\n`); });
 }
 
-function run(script, args = [], env = {}) {
+function run(script, args = [], env = {}, tag) {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [path.join(DIR, script), ...args], {
       cwd: DIR,
       stdio: ['inherit', 'pipe', 'pipe'],
       env: { ...process.env, ...env },
     });
-    stampLines(child.stdout, process.stdout);
-    stampLines(child.stderr, process.stderr);
+    stampLines(child.stdout, process.stdout, tag);
+    stampLines(child.stderr, process.stderr, tag);
     child.on('error', reject);
     child.on('close', (code) => {
       if (code === 0) resolve();
@@ -72,12 +74,12 @@ function fmtDuration(ms) {
 // Returns true on success. The stage scripts exit 1 on partial failures too,
 // so false means "some cases need a retry", not necessarily "nothing worked" —
 // every stage resumes, so re-running retries just the incomplete cases.
-async function step(title, script, args = [], env = {}) {
+async function step(title, script, args = [], env = {}, tag) {
   console.log('');
   log.step(`${pc.bold(title)} ${ts()}`);
   const started = Date.now();
   try {
-    await run(script, args, env);
+    await run(script, args, env, tag);
     log.success(`${pc.green(`${title} — done in ${fmtDuration(Date.now() - started)}`)} ${ts()}`);
     return true;
   } catch (err) {
@@ -170,6 +172,33 @@ async function uploadDataset(root) {
   await step('Upload to NotusPoint', 'uploadCases.js', args, { MIGRATION_ROOT: root.root });
 }
 
+// Runs the document download and the uploader side by side. The uploader is
+// pass-based: each uploadCases.js run drains every case whose documents are
+// done, then exits — so passes repeat (paced) while the download runs, and a
+// final pass sweeps up the last cases. Interleaved ledger writes are safe
+// (lib/ledger.js locks and merges each patch).
+async function downloadWithConcurrentUpload(uploadArgs) {
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  let downloadDone = false;
+  const docsPromise = step('Download documents', 'downloadDocuments.js', [], {}, pc.magenta('[docs]'))
+    .finally(() => { downloadDone = true; });
+
+  let pass = 0;
+  let uploadOk = true;
+  while (!downloadDone) {
+    pass++;
+    uploadOk = await step(`Upload pass ${pass} (concurrent)`, 'uploadCases.js', uploadArgs, { MIGRATION_ROOT: MAIN.root }, pc.cyan('[upload]'));
+    // Pace the passes — each one rescans all exported data — but cut the wait
+    // short the moment the download finishes
+    if (!downloadDone) await Promise.race([docsPromise, sleep(20000)]);
+  }
+  const docsOk = await docsPromise;
+  // Final drain: picks up cases whose documents finished after the last pass
+  // started, and retries anything that failed mid-overlap
+  uploadOk = await step(`Upload pass ${pass + 1} (final drain)`, 'uploadCases.js', uploadArgs, { MIGRATION_ROOT: MAIN.root }, pc.cyan('[upload]'));
+  return { docsOk, uploadOk };
+}
+
 async function runPipeline({ fresh }) {
   if (fresh) {
     const haveState = fs.existsSync(MAIN.ledgerFile) || fs.existsSync(MAIN.dataDir);
@@ -186,9 +215,35 @@ async function runPipeline({ fresh }) {
 
   log.info(`${countLines(MAIN.caseList)} case(s) in the list.`);
   const exportOk = await step('Export case data', 'runAll.js');
+  if (!exportOk) {
+    log.warn('Some cases failed to export — run "Resume / retry" to retry them, or continue anyway.');
+    const anyway = await confirm({ message: 'Continue to documents/upload anyway?', initialValue: false });
+    if (cancelled(anyway) || anyway !== true) return;
+  }
+
+  // The document download dominates the run; the uploader only touches cases
+  // whose documents are complete, so it can drain finished cases while the
+  // rest still download instead of waiting for all of them.
+  let uploadArgs = null; // null = don't upload concurrently
+  const overlap = await confirm({
+    message: 'Upload to NotusPoint while documents download? (fastest — importer must be running)',
+  });
+  if (!cancelled(overlap) && overlap === true && (await confirmUploadTarget())) {
+    const withFiles = await confirm({ message: 'Upload documents/files too? ("No" = cases + costs only, no file links)' });
+    if (!cancelled(withFiles)) uploadArgs = withFiles === false ? ['--skip-files'] : [];
+  }
+
+  if (uploadArgs !== null) {
+    const { docsOk, uploadOk } = await downloadWithConcurrentUpload(uploadArgs);
+    if (!docsOk || !uploadOk) {
+      log.warn('Some cases are incomplete — "Resume / retry" retries just the missing stages.');
+    }
+    return;
+  }
+
   const docsOk = await step('Download documents', 'downloadDocuments.js');
-  if (!exportOk || !docsOk) {
-    log.warn('Some cases failed to export/download — run "Resume / retry" to retry them before uploading, or continue anyway.');
+  if (!docsOk) {
+    log.warn('Some cases failed to download — run "Resume / retry" to retry them before uploading, or continue anyway.');
     const anyway = await confirm({ message: 'Continue to upload anyway?', initialValue: false });
     if (cancelled(anyway) || anyway !== true) return;
   } else {

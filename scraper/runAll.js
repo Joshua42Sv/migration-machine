@@ -14,7 +14,7 @@ const LIST_FILE = process.argv[2] || paths.caseList;
 // How many cases capture concurrently. Total CM load is governed by the
 // client's global CM_MAX_INFLIGHT cap either way; this just keeps enough
 // case work queued to fill it.
-const CASE_CONCURRENCY = Number(process.env.CM_CASE_CONCURRENCY ?? 6);
+const CASE_CONCURRENCY = Number(process.env.CM_CASE_CONCURRENCY ?? 12);
 
 if (!USERNAME || !PASSWORD) {
   console.error('Set CM_USER and CM_PASS environment variables');
