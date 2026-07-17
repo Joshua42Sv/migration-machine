@@ -144,6 +144,16 @@ function tally(root = MAIN) {
 // Menu actions
 // ---------------------------------------------------------------------------
 
+// Quick reachability probe so a run isn't started against nothing.
+async function importerReachable() {
+  try {
+    await fetch(IMPORT_URL, { method: 'OPTIONS', signal: AbortSignal.timeout(3000) });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function confirmUploadTarget() {
   note(
     `Importer: ${pc.cyan(IMPORT_URL)}\n` +
@@ -214,46 +224,29 @@ async function runPipeline({ fresh }) {
   }
 
   log.info(`${countLines(MAIN.caseList)} case(s) in the list.`);
-  const exportOk = await step('Export case data', 'runAll.js');
-  if (!exportOk) {
-    log.warn('Some cases failed to export — run "Resume / retry" to retry them, or continue anyway.');
-    const anyway = await confirm({ message: 'Continue to documents/upload anyway?', initialValue: false });
-    if (cancelled(anyway) || anyway !== true) return;
-  }
 
-  // The document download dominates the run; the uploader only touches cases
-  // whose documents are complete, so it can drain finished cases while the
-  // rest still download instead of waiting for all of them.
-  let uploadArgs = null; // null = don't upload concurrently
-  const overlap = await confirm({
-    message: 'Upload to NotusPoint while documents download? (fastest — importer must be running)',
-  });
-  if (!cancelled(overlap) && overlap === true && (await confirmUploadTarget())) {
-    const withFiles = await confirm({ message: 'Upload documents/files too? ("No" = cases + costs only, no file links)' });
-    if (!cancelled(withFiles)) uploadArgs = withFiles === false ? ['--skip-files'] : [];
-  }
-
-  if (uploadArgs !== null) {
-    const { docsOk, uploadOk } = await downloadWithConcurrentUpload(uploadArgs);
-    if (!docsOk || !uploadOk) {
-      log.warn('Some cases are incomplete — "Resume / retry" retries just the missing stages.');
-    }
+  // No questions past this point. The upload (files included) always runs
+  // concurrently with the document download; partial failures never block
+  // the pipeline — incomplete cases are skipped downstream and "Resume /
+  // retry" picks them up. The only hard precondition is a reachable
+  // importer, checked here instead of asked about.
+  if (!(await importerReachable())) {
+    log.error(`NotusPoint importer not reachable at ${IMPORT_URL} — start the dev server (:8080) and re-run.`);
     return;
   }
+  log.info(`Uploading to ${IMPORT_URL} as documents complete. If the NotusPoint DB was cleared since the last upload, Ctrl+C and wipe the upload records first (menu → Wipe migration state).`);
 
-  const docsOk = await step('Download documents', 'downloadDocuments.js');
-  if (!docsOk) {
-    log.warn('Some cases failed to download — run "Resume / retry" to retry them before uploading, or continue anyway.');
-    const anyway = await confirm({ message: 'Continue to upload anyway?', initialValue: false });
-    if (cancelled(anyway) || anyway !== true) return;
-  } else {
-    const upload = await confirm({ message: 'Export complete. Upload to NotusPoint now?' });
-    if (cancelled(upload) || upload !== true) {
-      log.info('Skipped upload — run "Upload to NotusPoint" from the menu when ready.');
-      return;
-    }
+  const exportOk = await step('Export case data', 'runAll.js');
+  if (!exportOk) {
+    log.warn('Some cases failed to export — continuing without them; "Resume / retry" will retry them.');
   }
-  await uploadDataset(MAIN);
+
+  const { docsOk, uploadOk } = await downloadWithConcurrentUpload([]);
+  if (!exportOk || !docsOk || !uploadOk) {
+    log.warn('Some cases are incomplete — "Resume / retry" retries just the missing stages.');
+  } else {
+    log.success('Pipeline complete — run "✅ Verify migration" to cross-check the results.');
+  }
 }
 
 // A single case gets its own workspace under single/<caseId>/ (its own data,
@@ -323,6 +316,7 @@ async function verify() {
   const issues = [];
   const warnings = [];
   const noClient = [];
+  const purged = [];
   let complete = 0;
 
   for (const id of caseIds) {
@@ -338,8 +332,16 @@ async function verify() {
       noClient.push(id);
     }
 
+    if (docs?.status === 'done' && docs.placeholders > 0) {
+      warnings.push(`${id}: ${docs.placeholders} document(s) missing in Case Manager — migrated as placeholder note(s)`);
+    }
+
     if (docs?.status !== 'done') {
       problems.push(`documents ${docs?.status ?? 'pending'}${docs?.expected != null ? ` (${docs.downloaded}/${docs.expected})` : ''}`);
+    } else if (up?.purgedAt) {
+      // Fully uploaded and locally purged — there's nothing on disk to
+      // recount, and that's by design
+      purged.push(id);
     } else if (docs.downloaded > 0) {
       // Trust nothing: recount what's actually on disk against the manifest
       const caseDir = path.join(MAIN.documentsDir, id);
@@ -390,6 +392,7 @@ async function verify() {
     casesInList: caseIds.length,
     fullyMigrated: complete,
     notImportableNoClient: noClient,
+    localDocumentsPurged: purged,
     issues,
     warnings,
   };
@@ -398,6 +401,7 @@ async function verify() {
 
   const lines = [
     `${pc.green(`${complete}/${caseIds.length}`)} case(s) fully migrated (export + documents + upload verified)`,
+    purged.length ? pc.dim(`${purged.length} of them had their local documents deleted after upload (disk recount skipped)`) : null,
     noClient.length ? `${noClient.length} case(s) have no Client contact — nothing importable` : null,
     issues.length ? pc.red(`${issues.length} case(s) with problems:`) : pc.green('No problems found.'),
     ...issues.slice(0, 15).map((i) => `  ${i.caseId}: ${i.problems.join('; ')}`),
@@ -455,8 +459,16 @@ async function wipeUploadRecords() {
 
   const ledger = loadLedger(MAIN.root);
   let cleared = 0;
+  let redownload = 0;
   for (const entry of Object.values(ledger.state.cases)) {
-    if (entry.upload) { delete entry.upload; cleared++; }
+    if (entry.upload) {
+      // Purged cases have no local documents anymore — reset their download
+      // stage too, so the next run re-fetches them before re-uploading
+      // (otherwise they'd re-import with zero files)
+      if (entry.upload.purgedAt) { delete entry.documents; redownload++; }
+      delete entry.upload;
+      cleared++;
+    }
   }
   ledger.state.staff = {};
   ledger.save();
@@ -469,6 +481,9 @@ async function wipeUploadRecords() {
     }
   }
   log.success(`Reset upload records for ${cleared} case(s), ${sidecars} file-upload sidecar(s), and the staff map.`);
+  if (redownload) {
+    log.info(`${redownload} case(s) had their local documents purged after upload — they will re-download on the next run.`);
+  }
   log.info('Note: single-case workspaces keep their own ledgers — wipe those separately if needed.');
 }
 
@@ -571,13 +586,9 @@ async function status() {
   const singles = singleWorkspaces();
   if (singles.length) lines.push(`${'Single-case workspaces'.padEnd(26)}${singles.join(', ')}`);
 
-  // Quick reachability probe so an upload isn't attempted against nothing.
-  try {
-    await fetch(IMPORT_URL, { method: 'OPTIONS', signal: AbortSignal.timeout(3000) });
-    lines.push(`${'NotusPoint importer'.padEnd(26)}${pc.green('reachable')}`);
-  } catch {
-    lines.push(`${'NotusPoint importer'.padEnd(26)}${pc.red('not reachable')} ${pc.dim('(is the dev server on :8080 running?)')}`);
-  }
+  lines.push(await importerReachable()
+    ? `${'NotusPoint importer'.padEnd(26)}${pc.green('reachable')}`
+    : `${'NotusPoint importer'.padEnd(26)}${pc.red('not reachable')} ${pc.dim('(is the dev server on :8080 running?)')}`);
 
   note(lines.join('\n'), 'Migration status');
 }

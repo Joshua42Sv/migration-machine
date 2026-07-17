@@ -39,15 +39,18 @@ if (!fs.existsSync(DATA_DIR) || !fs.existsSync(paths.sharedFile)) {
 
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
-function randomEmail() {
-  const digits = Math.floor(100000000 + Math.random() * 900000000);
-  return `${digits}@example.com`;
+// Deterministic per CM employee: the staff import matches on email and
+// returns an existing user untouched, so the same employee must map to the
+// same placeholder address on every run — a random one would mint a
+// duplicate user each time the ledger is reset.
+function fallbackEmail(employee) {
+  return `cm-${String(employee.id).toLowerCase()}@example.com`;
 }
 
 function toStaffImportDto(employee) {
   const email = EMAIL_PATTERN.test(employee.email)
     ? employee.email
-    : randomEmail();
+    : fallbackEmail(employee);
 
   const dto = {
     firstName: employee.firstName || "Unknown",
@@ -119,7 +122,6 @@ function toCaseImportDto(caseRecord, resolvedEmailByEmployeeId) {
     clientPhone: caseRecord.clientPhone || "0000 0000 0000",
     clientTitle: caseRecord.clientTitle || "Unknown",
     claimNumber: caseRecord.claimNumber || "Unknown",
-    referralDate: caseRecord.referralDate || "Unknown",
     dateClosed: caseRecord.dateClosed || "",
     clientAddress: {
       addressLine1: address.addressLine1 || "Unknown",
@@ -140,6 +142,10 @@ function toCaseImportDto(caseRecord, resolvedEmailByEmployeeId) {
     customerId: "b6db684c-1bfa-479d-93ad-0d6d4402966a", // TODO: Replace with actual customer ID, mapped from old to new
     requirementId: "64360683-a5bd-4262-b82f-12800e9f96b9", // TODO: Replace with actual requirement ID, mapped from old to new
   };
+
+  // No referral date in Case Manager -> none in NotusPoint; a placeholder
+  // string would be parsed into an invalid Date and rejected by the DB
+  if (caseRecord.referralDate) dto.referralDate = caseRecord.referralDate;
 
   // Status text ("Open") maps onto NotusPoint's CaseStatus enum; the importer
   // rejects values it doesn't recognise rather than guessing
@@ -276,7 +282,7 @@ async function uploadCaseFile(caseId, entry, uploadedById) {
   form.append("caseId", caseId);
   form.append("title", entry.title);
   form.append("fileType", entry.fileType);
-  form.append("uploadedById", uploadedById);
+  if (uploadedById) form.append("uploadedById", uploadedById);
   form.append("dateUploaded", entry.dateUploaded || new Date().toISOString());
 
   const res = await fetch(IMPORT_FILE_URL, { method: "POST", body: form });
@@ -368,20 +374,19 @@ async function uploadCosts(caseId, costs) {
   }
   const staff = employees.filter((e) => neededEmployeeIds.has(e.id));
 
-  // Staff already imported on a previous run are reused from the ledger (the
-  // importer rejects duplicates, and their user ids are needed either way)
+  // EVERY staff member the ledger knows resolves — not just those referenced
+  // by this pass's ready cases. During the concurrent download each upload
+  // pass sees only a slice of the cases, so a pass must be able to attribute
+  // documents to staff an earlier pass imported.
   const resolvedEmailByEmployeeId = new Map();
   const resolvedUserIdByEmployeeId = new Map();
-  const pendingStaff = [];
-  for (const employee of staff) {
-    const known = ledger.state.staff[employee.id];
+  for (const [employeeId, known] of Object.entries(ledger.state.staff)) {
     if (known?.userId) {
-      resolvedEmailByEmployeeId.set(employee.id, known.email);
-      resolvedUserIdByEmployeeId.set(employee.id, known.userId);
-    } else {
-      pendingStaff.push(employee);
+      resolvedEmailByEmployeeId.set(employeeId, known.email);
+      resolvedUserIdByEmployeeId.set(employeeId, known.userId);
     }
   }
+  const pendingStaff = staff.filter((e) => !resolvedUserIdByEmployeeId.has(e.id));
 
   console.error(
     `Total: ${staff.length} staff referenced, ${staff.length - pendingStaff.length} already uploaded, ${pendingStaff.length} to upload`,
@@ -430,6 +435,32 @@ async function uploadCosts(caseId, costs) {
   let filesSkipped = 0;
   let costsBlocked = 0;
   let completedCases = 0;
+  let docsPurged = 0;
+
+  // Frees local disk once nothing can need a case's documents again — the
+  // case, every file AND its costs are in NotusPoint (costs are the last
+  // consumer: they link to the file ids in .uploadState.json). Removes the
+  // whole documents/<caseId>/ directory and stamps upload.purgedAt in the
+  // ledger; exported case data (data/<caseId>.json) is kept. "Wipe upload
+  // records" resets the documents stage for purged cases so a re-upload
+  // re-downloads them first.
+  function purgeDocumentsIfComplete(caseId) {
+    const up = ledger.getCase(caseId).upload ?? {};
+    if (
+      up.case?.status !== "done" ||
+      up.files?.status !== "done" ||
+      up.costs?.status !== "done" ||
+      up.purgedAt
+    ) {
+      return false;
+    }
+    const caseDir = path.join(DOCUMENTS_DIR, caseId);
+    if (!fs.existsSync(caseDir)) return false;
+    fs.rmSync(caseDir, { recursive: true, force: true });
+    ledger.updateStage(caseId, "upload", { purgedAt: new Date().toISOString() });
+    docsPurged++;
+    return true;
+  }
   // Bounds concurrent file POSTs across ALL case workers, so importer load
   // stays capped no matter how case work is distributed
   const fileLimiter = createLimiter(FILE_CONCURRENCY);
@@ -451,6 +482,10 @@ async function uploadCosts(caseId, costs) {
     const costsDone = up.costs?.status === "done";
     if (caseDone && filesDone && costsDone) {
       alreadyComplete++;
+      // Catches cases completed before a purge existed (or where it failed)
+      if (purgeDocumentsIfComplete(caseId)) {
+        return "already uploaded — local documents deleted";
+      }
       return null;
     }
 
@@ -469,13 +504,9 @@ async function uploadCosts(caseId, costs) {
     }
 
     // 2. Files, in parallel through the shared limiter. Each uploads as the
-    // user who created the document in Case Manager; when that can't be
-    // resolved (no createdById, or the staff upload failed) fall back to the
-    // case's assigned user, then any imported staff member
-    const fallbackUploaderId =
-      resolvedUserIdByEmployeeId.get(caseRecord.assignedUserId) ||
-      resolvedUserIdByEmployeeId.values().next().value;
-
+    // user who created the document in Case Manager; a document whose creator
+    // is unknown imports with NO uploader — attribution mirrors CM exactly
+    // and is never synthesized from the assigned user or anyone else.
     const uploadState = loadUploadState(caseId);
     const entryKey = (entry) => entry.documentId || entry.filename;
     const pendingEntries = manifest.filter(
@@ -487,8 +518,7 @@ async function uploadCosts(caseId, costs) {
     await Promise.all(
       pendingEntries.map((entry) =>
         fileLimiter(async () => {
-          const uploadedById =
-            resolvedUserIdByEmployeeId.get(entry.createdById) || fallbackUploaderId;
+          const uploadedById = resolvedUserIdByEmployeeId.get(entry.createdById);
           try {
             const file = await uploadCaseFile(caseId, entry, uploadedById);
             uploadState.byDocumentId[entryKey(entry)] = file?.id ?? "";
@@ -564,6 +594,7 @@ async function uploadCosts(caseId, costs) {
       }
     }
 
+    if (purgeDocumentsIfComplete(caseId)) parts.push("local documents deleted");
     return parts.join(", ");
   }
 
@@ -583,6 +614,11 @@ async function uploadCosts(caseId, costs) {
   console.error(
     `${filesUploaded} file(s) uploaded, ${filesSkipped} already uploaded, ${failedFiles.length} failed.`,
   );
+  if (docsPurged) {
+    console.error(
+      `${docsPurged} case(s) fully in NotusPoint — their local documents were deleted to free disk space.`,
+    );
+  }
   if (waitingDocs) {
     console.error(`${waitingDocs} case(s) still waiting for documents - re-run to pick them up.`);
   }

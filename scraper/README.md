@@ -114,12 +114,14 @@ requests wait on. Knobs (env vars):
 | `UPLOAD_CASE_CONCURRENCY` | 8 | Cases uploaded at once |
 | `UPLOAD_FILE_CONCURRENCY` | 32 | Concurrent file POSTs to the importer (global, across all cases) |
 
-**Download and upload run at the same time** in the CLI pipeline: answer
-"yes" to the concurrent-upload prompt and upload passes drain each case as
-its documents complete, so the upload adds no wall-clock time. (Manually:
-`downloadDocuments.js` in one terminal, re-run `uploadCases.js` in another —
-ledger writes are lock-protected and merge, so concurrent processes are
-safe.)
+**Download and upload always run at the same time** in the CLI pipeline
+(🚀 / ▶️): after the export, upload passes drain each case as its documents
+complete, so the upload adds no wall-clock time. The pipeline asks nothing
+after it starts — the importer is probed for reachability up front, and
+partial failures are carried forward for "Resume / retry" instead of
+prompting. (Manually: `downloadDocuments.js` in one terminal, re-run
+`uploadCases.js` in another — ledger writes are lock-protected and merge,
+so concurrent processes are safe.)
 
 ## Underlying scripts
 
@@ -154,7 +156,21 @@ Downloads every document attached to each not-yet-done case into
 Incremental per document: a retried case keeps every file its previous run
 downloaded (matched by `documentId` via the manifest) and fetches only the
 missing ones, so one failed document costs one re-download, not the whole
-case. Documents across all in-flight cases download in parallel through the
+case.
+
+**Documents broken in Case Manager itself** (a CM 5xx on every retry — the
+same signature as documents that fail to open in the CM UI) are migrated
+automatically as placeholder CASE_NOTEs carrying the original title, date
+and creator, whose text explains the file was unrecoverable at the source —
+so the case completes its migration and anyone looking for the file in
+NotusPoint learns what happened. Guard rails: timeouts/network errors and
+4xx (WAF, auth) never convert — they stay failures and retry on resume —
+and at most `CM_AUTO_PLACEHOLDER_CAP` (default 10) documents convert per
+run, so a CM outage 500-ing everything can't mass-convert real documents.
+Each conversion is logged with its document id, and Verify lists affected
+cases as warnings. `missingDocuments.txt` (one document id per line, `#`
+comments) still works to pre-mark known-broken documents so they skip the
+retry cycle entirely. Documents across all in-flight cases download in parallel through the
 global `CM_MAX_INFLIGHT` pool. Creator attribution (`CreatedByID`) is
 mandatory — files must be attributed exactly as in Case Manager — so for
 real files the per-document `GetData` call is skipped only when the list
@@ -181,13 +197,29 @@ from their Case Manager documents:
    their file links; `--costs-without-files` forces them through instead.
 
 Each file uploads as the NotusPoint user created for the Case Manager
-employee who created the document (manifest `createdById`), falling back
-to the case's assigned user, then any imported staff member. Staff are
-imported only for employees referenced somewhere: cost loggers, assigned
-case users, and document creators.
+employee who created the document (manifest `createdById`). A document
+whose creator is unknown in CM imports with no uploader — attribution
+mirrors CM exactly and is never synthesized. The employee list is fetched
+with inactives included so departed staff still resolve; staff are imported
+only for employees referenced somewhere: cost loggers, assigned case users,
+and document creators.
+
+**Local documents are deleted once a case is fully in NotusPoint** (case +
+every file + costs all done — costs are the last consumer of the local
+sidecar): the whole `documents/<caseId>/` directory is removed and
+`upload.purgedAt` stamped in the ledger, keeping disk usage bounded at
+roughly the in-flight cases instead of the whole migration. Exported case
+data (`data/<caseId>.json`) is kept. Verify skips the disk recount for
+purged cases, and "Wipe upload records" resets their documents stage so a
+re-upload re-downloads them first.
 
 Fully resume-aware: cases/files/costs/staff already accepted by the
 importer are skipped via the ledger and the per-case `.uploadState.json`.
+Staff import is also idempotent on the NotusPoint side — a user whose email
+already exists is returned untouched (never updated), so re-runs against a
+live DB can't clobber NotusPoint-side changes. Case import still rejects
+duplicate case IDs: if the NotusPoint DB was cleared since the last upload,
+wipe the upload records first (menu → Wipe migration state).
 Only cases whose `documents` stage is `done` are touched (so it can run
 alongside the downloader); file POSTs run `UPLOAD_FILE_CONCURRENCY` at a
 time across `UPLOAD_CASE_CONCURRENCY` concurrent cases. `--skip-files`

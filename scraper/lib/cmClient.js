@@ -100,7 +100,9 @@ async function createClient({
           }
         }
       }
-      throw new Error(`${label} failed after ${MAX_ATTEMPTS} attempts: ${lastErr.message}`);
+      const err = new Error(`${label} failed after ${MAX_ATTEMPTS} attempts: ${lastErr.message}`);
+      err.status = lastErr.status; // callers distinguish CM HTTP errors from network/timeouts
+      throw err;
     });
   }
 
@@ -129,7 +131,9 @@ async function createClient({
     if (!res.ok()) {
       const text = await res.text().catch(() => '');
       if (status === 401 || /LogOn/i.test(text)) throw new SessionExpiredError(label);
-      throw new Error(`${label} ${status}: ${text.slice(0, 120)}`);
+      const err = new Error(`${label} ${status}: ${text.slice(0, 120)}`);
+      err.status = status;
+      throw err;
     }
     const contentType = res.headers()['content-type'] || '';
     const disposition = res.headers()['content-disposition'] || '';
@@ -162,7 +166,10 @@ async function createClient({
     },
 
     getEmployeeList: async () => {
-      const body = await postForm('/EmployeeList/_List', '/EmployeeList/_List', { ShowInactive: false });
+      // Inactive employees included: historical documents/costs are often
+      // created by staff who have since left, and attribution must resolve
+      // to the real person (only employees actually referenced get imported)
+      const body = await postForm('/EmployeeList/_List', '/EmployeeList/_List', { ShowInactive: true });
       return body.data ?? [];
     },
 

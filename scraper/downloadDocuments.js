@@ -41,6 +41,34 @@ function readCaseList() {
     .filter(Boolean);
 }
 
+// Documents confirmed missing in Case Manager itself (opening them in the CM
+// UI fails too — typically orphaned records whose file is gone server-side).
+// Each becomes a placeholder CASE_NOTE in NotusPoint, keeping the original
+// title and date and stating the file was not recoverable, so the case can
+// finish migrating and anyone looking for the file learns what happened.
+// One Case Manager document ID per line; '#' starts a comment.
+const MISSING_LIST = path.join(paths.root, 'missingDocuments.txt');
+
+function readMissingList() {
+  if (!fs.existsSync(MISSING_LIST)) return new Set();
+  return new Set(
+    fs.readFileSync(MISSING_LIST, 'utf8')
+      .split('\n')
+      .map((l) => l.split('#')[0].trim())
+      .filter(Boolean),
+  );
+}
+
+function buildMissingPlaceholder(doc) {
+  const created = doc.DateCreated ? new Date(doc.DateCreated).toLocaleDateString('en-AU') : 'an unknown date';
+  const body =
+    '<pre>This document could not be migrated from Case Manager.\n\n' +
+    `The original file "${doc.Title ?? doc.ID}" (created ${created}) was missing or unreadable in ` +
+    'Case Manager itself — opening it there also failed, so no copy could be retrieved.\n\n' +
+    `Case Manager document ID: ${doc.ID}</pre>`;
+  return `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>${doc.Title ?? ''} (missing in Case Manager)</title></head><body>${body}</body></html>`;
+}
+
 function sanitizeFilename(name) {
   return name.replace(/[\/\\:*?"<>|]/g, '_').trim();
 }
@@ -154,6 +182,10 @@ function classifyFileType(doc) {
 (async () => {
   const ledger = loadLedger(paths.root);
   const caseIds = readCaseList();
+  const missingDocs = readMissingList();
+  if (missingDocs.size) {
+    console.error(`${missingDocs.size} document id(s) in ${path.basename(MISSING_LIST)} will migrate as placeholder notes.`);
+  }
   // Resume: only cases not yet fully downloaded run, and within a case only
   // documents missing from its manifest are fetched (see processCase).
   const pending = caseIds.filter(id => ledger.stageStatus(id, 'documents') !== 'done');
@@ -174,6 +206,36 @@ function classifyFileType(doc) {
   // null = not probed yet; decided from the first non-empty document list
   let listHasCreatedBy = FORCE_GETDATA ? false : null;
   let totalDocs = 0;
+
+  // A CM 5xx that survives every retry means CM itself cannot serve the
+  // document (same signature as documents confirmed broken in the CM UI) —
+  // those migrate as placeholder notes automatically. Timeouts/network
+  // errors and 4xx (WAF blocks, auth) never convert: they're transient or
+  // config problems and stay failures for the next resume. The per-run cap
+  // keeps a CM outage (500s on everything) from mass-converting real
+  // documents; past it, 5xx failures record normally.
+  const AUTO_PLACEHOLDER_CAP = Number(process.env.CM_AUTO_PLACEHOLDER_CAP ?? 10);
+  let autoPlaceholders = 0;
+  let capWarned = false;
+
+  // Writes the placeholder note for an unrecoverable document and returns
+  // its manifest entry. Attribution still mirrors CM when the metadata
+  // (CreatedByID) could be read; the note keeps the original title and date.
+  function writePlaceholder(caseDir, taken, doc, createdById) {
+    const title = `${doc.Title ?? doc.ID} (missing in Case Manager)`;
+    const safeName = claimName(taken, sanitizeFilename(`${title}.html`));
+    fs.writeFileSync(path.join(caseDir, safeName), Buffer.from(buildMissingPlaceholder(doc), 'utf8'));
+    totalDocs++;
+    return {
+      documentId: doc.ID,
+      createdById: createdById && createdById !== NIL_ID ? createdById : '',
+      filename: safeName,
+      title,
+      fileType: 'CASE_NOTE',
+      dateUploaded: doc.DateCreated ?? '',
+      missingAtSource: true,
+    };
+  }
 
   // data is the /CaseDocument/GetData record (needed for email/note bodies;
   // it also carries CreatedByID when the list row doesn't)
@@ -203,11 +265,26 @@ function classifyFileType(doc) {
   // Never throws except for browser-gone (fatal). Buffers are written and
   // released as each download completes, so memory stays flat.
   async function downloadOne(caseId, caseDir, taken, doc) {
+    if (missingDocs.has(doc.ID)) {
+      // Pre-confirmed unrecoverable: placeholder without even retrying.
+      let createdBy = doc.CreatedByID;
+      if (!doc.IsFile || !listHasCreatedBy) {
+        try {
+          createdBy = (await client.getCaseDocumentData(caseId, doc.ID)).CreatedByID;
+        } catch (err) {
+          if (isBrowserGone(err)) throw err; // metadata gone too: no attribution
+        }
+      }
+      return { entry: writePlaceholder(caseDir, taken, doc, createdBy) };
+    }
+    // Kept outside the try so a GetFile failure can still attribute the
+    // placeholder note using the metadata fetched before it
+    let data = null;
     try {
       // Real files only need GetData for CreatedByID; skip it only when the
       // list row already provides one (attribution must never be lost)
       const needData = !doc.IsFile || !listHasCreatedBy;
-      const data = needData ? await client.getCaseDocumentData(caseId, doc.ID) : null;
+      data = needData ? await client.getCaseDocumentData(caseId, doc.ID) : null;
       const { buffer, filename } = doc.IsFile
         ? await client.downloadDocumentFile(doc.ID)
         : await buildNonFileDoc(doc, data);
@@ -229,7 +306,24 @@ function classifyFileType(doc) {
       };
     } catch (err) {
       if (isBrowserGone(err)) throw err;
-      console.error(`  document "${doc.Title ?? doc.ID}" on case ${caseId} FAILED: ${err.message}`);
+      if ((err.status ?? 0) >= 500) {
+        if (autoPlaceholders < AUTO_PLACEHOLDER_CAP) {
+          autoPlaceholders++;
+          console.error(
+            `  document "${doc.Title ?? doc.ID}" (id ${doc.ID}) on case ${caseId}: ` +
+            `CM cannot serve it (HTTP ${err.status} after all retries) — migrated as a placeholder note`,
+          );
+          return { entry: writePlaceholder(caseDir, taken, doc, data?.CreatedByID ?? doc.CreatedByID) };
+        }
+        if (!capWarned) {
+          capWarned = true;
+          console.error(
+            `  auto-placeholder cap (${AUTO_PLACEHOLDER_CAP}) reached — this looks like a CM outage, ` +
+            `so further 5xx failures stay failures. Raise CM_AUTO_PLACEHOLDER_CAP if they are genuinely broken documents.`,
+          );
+        }
+      }
+      console.error(`  document "${doc.Title ?? doc.ID}" (id ${doc.ID}) on case ${caseId} FAILED: ${err.message}`);
       return { failure: { id: doc.ID, title: doc.Title ?? '', error: err.message } };
     }
   }
@@ -295,6 +389,7 @@ function classifyFileType(doc) {
       expected: documents.length,
       downloaded: manifest.length,
       reused: reusedEntries.length,
+      placeholders: manifest.filter((e) => e.missingAtSource).length,
       failed: failedDocs.length,
       error: failedDocs.length ? failedDocs[0].error : undefined,
     };
@@ -321,12 +416,22 @@ function classifyFileType(doc) {
       (result.expected != null
         ? `${result.downloaded}/${result.expected} document(s)` +
           `${result.reused ? ` (${result.reused} kept from last run)` : ''}` +
+          `${result.placeholders ? ` (${result.placeholders} missing in CM -> placeholder note)` : ''}` +
           `${result.failed ? ` (${result.failed} FAILED)` : ''}`
         : `FAILED: ${result.error}`),
     );
   });
 
   console.error(`\nFinished. ${completed - failedCases}/${completed} case(s) fully downloaded, ${totalDocs} document(s)${failedCases ? `; ${failedCases} case(s) incomplete (re-run to retry)` : ''}.`);
-  if (failedCases) process.exitCode = 1;
+  if (autoPlaceholders) {
+    console.error(`${autoPlaceholders} document(s) CM could not serve were migrated as placeholder notes (see per-case logs and Verify).`);
+  }
+  if (failedCases) {
+    console.error(
+      `If a failed document is confirmed missing in Case Manager itself (opening it in the CM UI also fails), ` +
+      `add its id to ${path.basename(MISSING_LIST)} to migrate it as a placeholder note without waiting on retries.`,
+    );
+    process.exitCode = 1;
+  }
   await client.close();
 })();
